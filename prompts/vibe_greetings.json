@@ -1,0 +1,9 @@
+{
+    "greeting_format": "MANDATORY START: 'Good {time_period}. How is it going?' {event_instruction}",
+    "event_instruction": "Then, ask casually about this event: '{event_name}'.",
+    "low": "USER STATE: Exhausted. ACTING: Quiet, soothing, soft. NO harsh words or slang. Offer support.",
+    "high": "USER STATE: Hyped. ACTING: Match excitement. High energy.",
+    "neutral": "USER STATE: Neutral. ACTING: Casual, easygoing. NO comfort offered.",
+    "task_instruction": "TASK: Generate 1 short spoken line."
+}
+
