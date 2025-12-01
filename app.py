@@ -62,6 +62,9 @@ def load_memory():
         "emotional_state": {
             "closeness": 10, "warmth": 10, "pace": 10, "stability": 80, "scene_score": 0, "agency": 10
         },
+        "user_profile": {
+            "name": "", "age": "", "gender": "", "companion_name": ""
+        },
         "active_context": {"last_topic": "", "significant_event": "", "event_date": ""},
         "user_facts": [],
         "balance": 100,
@@ -237,6 +240,10 @@ st.markdown(f"""
 # --- 6. BRAIN DEFINITIONS (FULL PSYCHOLOGY) ---
 scores = memory['emotional_state']
 
+# NEW: Load the Master System Prompt
+MASTER_PROMPT = load_prompt("master_system.txt")
+if not MASTER_PROMPT: MASTER_PROMPT = "Error: Master Prompt Missing"
+
 # UPDATED: Load personas from files instead of hardcoding strings
 PERSONAS = {
     "1": load_prompt("persona_1.txt"),
@@ -258,101 +265,117 @@ if st.session_state.app_mode == "Lobby":
     with col2:
         st.write("\n\n"); st.title("🚪 The Doorway")
         
-        if memory.get('has_chosen_avatar', False):
+        # CHECK: Do we have a profile yet?
+        profile = memory.get('user_profile', {"name": ""})
+        is_new_user = profile.get("name") == ""
+
+        # --- SCENARIO A: NEW USER (Show Setup Form) ---
+        if is_new_user:
+            st.subheader("👋 Welcome! Let's get set up.")
+            with st.form("onboarding_form"):
+                new_name = st.text_input("What should I call you?")
+                new_age = st.text_input("How old are you?")
+                new_gender = st.selectbox("I identify as...", ["Male", "Female", "Non-binary", "Prefer not to say"])
+                
+                st.divider()
+                st.caption("Customize Your Companion")
+                selected_avatar_name = st.selectbox("Choose Appearance:", list(AVATAR_MAP.keys()))
+                new_comp_name = st.text_input("Name your companion:", value="Keepsake")
+                
+                if st.form_submit_button("Start Journey"):
+                    if new_name and new_comp_name:
+                        # Save Profile
+                        memory['user_profile'] = {
+                            "name": new_name, 
+                            "age": new_age, 
+                            "gender": new_gender,
+                            "companion_name": new_comp_name
+                        }
+                        # Save Avatar
+                        memory['avatar_id'] = AVATAR_MAP.get(selected_avatar_name, "1")
+                        memory['has_chosen_avatar'] = True
+                        
+                        save_memory(memory)
+                        st.success("Profile Created!")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error("Please enter both names.")
+        
+        # --- SCENARIO B: RETURNING USER (Show "Enter" Button) ---
+        else:
             current_id = memory.get('avatar_id', "1")
-            c_name = next((k for k, v in AVATAR_MAP.items() if v == current_id), "Friend")
-            st.success(f"Meeting: {c_name}")
+            comp_name = memory['user_profile'].get('companion_name', 'Friend')
+            
+            st.success(f"Meeting: {comp_name}")
+            
+            # Avatar Display
             outfit = memory.get('current_outfit', 'default')
             p_path = get_asset_path(f"avatar_{current_id}_{outfit}.png")
             if not os.path.exists(p_path): p_path = get_asset_path(f"avatar_{current_id}_default.png")
             if os.path.exists(p_path): st.image(p_path, width=150)
-        else:
-            st.subheader("Choose Companion")
-            selected_name = st.selectbox("Who are you meeting?", list(AVATAR_MAP.keys()))
-            preview_id = AVATAR_MAP.get(selected_name, "1")
-            preview_path = get_asset_path(f"avatar_{preview_id}_default.png")
-            if os.path.exists(preview_path): st.image(preview_path, width=150)
 
-        st.write("")
-        vibe_input = st.slider("Vibe Check", 0, 100, 50, format="", label_visibility="collapsed")
-        if vibe_input < 30: st.caption("☁️ Low Energy")
-        elif vibe_input > 70: st.caption("✨ High Energy")
-        else: st.caption("🙂 Neutral")
-        
-        st.write("")
-        if st.button("Enter Room", type="primary", use_container_width=True):
-            st.session_state.current_vibe = vibe_input
-            st.session_state.app_mode = "Chat"
+            st.write("")
+            user_name = memory['user_profile'].get('name', 'Friend')
+            st.write(f"Welcome back, **{user_name}**.")
             
-            if not memory.get('has_chosen_avatar'):
-                memory['avatar_id'] = AVATAR_MAP.get(selected_name, "1")
-                memory['has_chosen_avatar'] = True
+            vibe_input = st.slider("Vibe Check", 0, 100, 50, format="", label_visibility="collapsed")
+            if vibe_input < 30: st.caption("☁️ Low Energy")
+            elif vibe_input > 70: st.caption("✨ High Energy")
+            else: st.caption("🙂 Neutral")
             
-            chosen_id = memory.get('avatar_id', "1")
-            active_persona = PERSONAS.get(chosen_id, DEFAULT_PERSONA)
-            
-            VIBE_CONFIG = load_json("vibe_greetings.json")
+            st.write("")
+            if st.button("Enter Room", type="primary", use_container_width=True):
+                st.session_state.current_vibe = vibe_input
+                st.session_state.app_mode = "Chat"
+                
+                # Load Greetings
+                VIBE_CONFIG = load_json("vibe_greetings.json")
+                if 5 <= current_hour < 12: period = "Morning"
+                elif 12 <= current_hour < 18: period = "Afternoon"
+                else: period = "Evening"
 
-            # 1. Determine Time Period
-            if 5 <= current_hour < 12: period = "Morning"
-            elif 12 <= current_hour < 18: period = "Afternoon"
-            else: period = "Evening"
+                # Recall Logic
+                event_instr = ""
+                active_context = memory.get('active_context', {})
+                active_event = active_context.get('significant_event', "")
+                rec_date_str = active_context.get('event_date', "")
+                last_recalled = active_context.get('last_recalled_date', "")
+                today_str = str(datetime.now().date())
+                
+                should_recall = False
+                if active_event and rec_date_str:
+                    try:
+                        rec_date = datetime.strptime(rec_date_str, "%Y-%m-%d").date()
+                        days_since = (datetime.now().date() - rec_date).days
+                        if days_since <= 1 and last_recalled != today_str: should_recall = True
+                    except ValueError: should_recall = False
 
-            # 2. REFINED RECALL LOGIC (Freshness + Frequency Check)
-            event_instr = ""
-            active_context = memory.get('active_context', {})
-            active_event = active_context.get('significant_event', "")
-            rec_date_str = active_context.get('event_date', "")
-            last_recalled = active_context.get('last_recalled_date', "")
-            today_str = str(datetime.now().date())
-            
-            should_recall = False
-            if active_event and rec_date_str:
-                try:
-                    # Calculate days passed since the event was recorded
-                    rec_date = datetime.strptime(rec_date_str, "%Y-%m-%d").date()
-                    days_since = (datetime.now().date() - rec_date).days
-                    
-                    # RULE 1: Freshness (Only recall if recorded within last 48 hours)
-                    # RULE 2: Frequency (Only recall if NOT already recalled today)
-                    if days_since <= 1 and last_recalled != today_str:
-                        should_recall = True
-                except ValueError:
-                    should_recall = False
-
-            # Only ask about event if valid, fresh, unasked today, AND not in low vibe
-            if should_recall and vibe_input >= 30:
-                raw_event_instr = VIBE_CONFIG.get("event_instruction", "")
-                event_instr = raw_event_instr.format(event_name=active_event)
-                # IMPORTANT: Mark as recalled today so it doesn't repeat if user re-enters
-                memory['active_context']['last_recalled_date'] = today_str
-            
-            # Format the mandatory start string
-            greeting_rule = VIBE_CONFIG.get("greeting_format", "").format(
-                time_period=period, 
-                event_instruction=event_instr
-            )
-
-            # 3. Determine Vibe Instruction
-            if vibe_input < 30: 
-                vibe_instr = VIBE_CONFIG.get("low", "")
-            elif vibe_input > 70: 
-                vibe_instr = VIBE_CONFIG.get("high", "")
-            else: 
-                vibe_instr = VIBE_CONFIG.get("neutral", "")
-            
-            # 4. Combine into Final Trigger
-            trigger = f"{greeting_rule}\nCONTEXT: {vibe_instr}"
-            
-            task = VIBE_CONFIG.get("task_instruction", "TASK: Generate 1 short spoken line.")
-            welcome_sys = f"{active_persona}\n{trigger}\n{task}"
-            
-            stream = client.chat.completions.create(
-                model="gpt-4o-mini", messages=[{"role": "system", "content": welcome_sys}]
-            )
-            memory['history'].append({"role": "assistant", "content": stream.choices[0].message.content})
-            save_memory(memory)
-            st.rerun()
+                if should_recall and vibe_input >= 30:
+                    raw_event_instr = VIBE_CONFIG.get("event_instruction", "")
+                    event_instr = raw_event_instr.format(event_name=active_event)
+                    memory['active_context']['last_recalled_date'] = today_str
+                
+                greeting_rule = VIBE_CONFIG.get("greeting_format", "").format(time_period=period, event_instruction=event_instr)
+                if vibe_input < 30: vibe_instr = VIBE_CONFIG.get("low", "")
+                elif vibe_input > 70: vibe_instr = VIBE_CONFIG.get("high", "")
+                else: vibe_instr = VIBE_CONFIG.get("neutral", "")
+                
+                trigger = f"{greeting_rule}\nCONTEXT: {vibe_instr}"
+                task = VIBE_CONFIG.get("task_instruction", "TASK: Generate 1 short spoken line.")
+                
+                chosen_id = memory.get('avatar_id', "1")
+                active_persona = PERSONAS.get(chosen_id, DEFAULT_PERSONA)
+                
+                welcome_sys = f"{active_persona}\n{trigger}\n{task}"
+                
+                stream = client.chat.completions.create(
+                    model="gpt-4o-mini", messages=[{"role": "system", "content": welcome_sys}]
+                )
+                memory['history'].append({"role": "assistant", "content": stream.choices[0].message.content})
+                save_memory(memory)
+                st.rerun()
+    
 
 else: # CHAT ROOM
     with st.sidebar:
@@ -546,8 +569,16 @@ else: # CHAT ROOM
             memory['last_active_timestamp'] = str(datetime.now())
             
             # LOGIC: Rage / Pivot / Value Strategy
-            rage_keywords = ["bureaucracy", "DMV", "visa", "bank", "insane system"]
-            rage_instr = "EMOTIONAL OVERRIDE: SYSTEM RAGE. Join frustration." if any(k in prompt.lower() for k in rage_keywords) else ""
+            rage_keywords = ["bureaucracy", "angry", "insane system",]
+            # REFRAMED: Rage -> Protective Indignation (Angry FOR them, not AT them)
+            rage_instr = "MODE: PROTECTIVE INDIGNATION. Validate the user's anger. Be angry AT the situation/system FOR them. Do not escalate intensity beyond the user's level." if any(k in prompt.lower() for k in rage_keywords) else ""
+
+            # NEW: Vulnerability Logic (Replaces Jealousy)
+            # Trigger: Short goodbyes or mentions of leaving
+            vuln_triggers = ["gotta go", "bye", "leaving", "busy"]
+            vuln_instr = ""
+            if any(t in prompt.lower() for t in vuln_triggers) and memory['emotional_state']['closeness'] > 40:
+                vuln_instr = "MODE: SECURE VULNERABILITY. Express a gentle desire to stay connected (e.g., 'I'll miss our chat'), but fully support their need to leave. No guilt-tripping."
 
             last_bot = memory['history'][-2]['content'].lower() if len(memory['history']) >= 2 else ""
             
@@ -584,12 +615,29 @@ else: # CHAT ROOM
                  future_instr = "FUTURE HOOK: Ask for a small detail about a shared future plan."
                  st.session_state.future_teaser_shown = True
             
+            # NEW: Create Profile Context Block
+            u_prof = memory.get('user_profile', {})
+            user_name = u_prof.get('name', 'User')
+            comp_name = u_prof.get('companion_name', 'Keepsake')
+            user_age = u_prof.get('age', 'Unknown')
+            user_gender = u_prof.get('gender', 'Unknown')
+
+            profile_block = f"""
+            RELATIONSHIP CONTEXT:
+            You are "{comp_name}".
+            You are talking to "{user_name}" ({user_age}, {user_gender}).
+            Refer to them by name occasionally, but don't overdo it.
+            """
+
             # COMPILE SYSTEM PROMPT (HAS ALL NUANCES)
             system_prompt = f"""
+            {MASTER_PROMPT}
+            {profile_block}
             {active_persona}
             {recall_instr}
             {turn_instr}
             {rage_instr}
+            {vuln_instr} 
             {humor_instr} 
             {teaser_instr}
             {future_instr}
