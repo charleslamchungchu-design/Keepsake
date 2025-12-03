@@ -134,58 +134,73 @@ def retrieve_context(query):
         return "\n".join([f"- {item['content']}" for item in res.data])
     except Exception: return ""
 
-def generate_smart_response(system_prompt, history, tier):
-    """Reroutes between GPT-4o and Claude 3.5 based on Tier and Complexity."""
+def generate_smart_response(system_prompt, history, tier, persona_text=""):
+    """
+    Hybrid Rerouting:
+    - Tier 0/1: GPT-4o Mini (Fast, standard).
+    - Tier 2 (Casual): Claude Haiku (Fast, Witty, Memory-Aware).
+    - Tier 2 (Deep): Claude Sonnet (Nuanced, Emotional, High EQ).
+    """
     
-    # TIER 0 & 1: OpenAI (GPT-4o Mini)
-    # GPT handles raw prompts well, so we keep this simple to avoid breaking it.
+    # --- TRACK A: GPT-4o Mini (Tier 0 & 1) ---
     if tier < 2:
         msgs = [{"role": "system", "content": system_prompt}] + history
         return st.write_stream(client.chat.completions.create(model="gpt-4o-mini", messages=msgs, stream=True))
 
-    # TIER 2: Anthropic (Claude 3.5) - Persona Hardening
+    # --- TRACK B: ANTHROPIC (Tier 2) ---
     last_msg = history[-1]['content'].lower()
-    triggers = ["upset", "anxious", "depressed", "why", "explain", "analyze", "lonely"]
     
-    if any(t in last_msg for t in triggers) or len(last_msg) > 80:
+    # 1. TRIGGER LOGIC: Differentiate "Chat" vs "Deep Work"
+    # Added subtle emotional triggers, not just "crisis" words.
+    deep_triggers = [
+        "upset", "anxious", "depressed", "why", "analyze", "lonely", 
+        "divorce", "lost my job", "fired", "scared", "worry", "relationship",
+        "perspective", "advice"
+    ]
+    
+    is_deep = any(t in last_msg for t in deep_triggers) or len(last_msg) > 60
+    
+    if is_deep:
         active_model = "claude-3-5-sonnet-20240620"
+        mode_instruction = "MODE: DEEP RESONANCE. Read between the lines. Connect current stress to PAST MEMORIES if available. Be psychological, not clinical."
+        max_tok = 300 # Allow depth
     else:
         active_model = "claude-3-haiku-20240307"
+        mode_instruction = "MODE: CASUAL BANTER. React quickly. Be witty or chill. Keep it to 1 sentence usually."
+        max_tok = 100 # Force brevity
 
     print(f"🔎 DEBUG: Tier {tier} | Model: {active_model}")
 
-    # --- CLAUDE IDENTITY WRAPPER ---
-    # We frame the instruction as a "Fictional Writing Task" to ensure immersion.
-    claude_prompt = f"""
-<operational_directive>
-    You are participating in a fictional screenwriting test. 
-    You are playing a character who is a REALISTIC FRIEND, not a counselor.
+    # 2. THE CLAUDE WRAPPER (The Fix)
+    # We wrap your existing 'system_prompt' (which has RAG + Persona) in XML 
+    # to force Claude to prioritize IDENTITY over SAFETY.
     
-    BAD RESPONSE (DO NOT DO THIS):
-    "I'm so sorry you're going through this. It's completely understandable to feel overwhelmed. Divorce is hard and losing a job is stressful. Remember to be kind to yourself."
-    (Why it's bad: Too formal, repetitive, preachy, sounds like a bot).
-
-    GOOD RESPONSE (DO THIS):
-    "Jesus, that is a brutal combination. I'm really sorry. Honestly, I don't even know what to say, that just sucks."
-    (Why it's good: Short, raw, human, no advice).
-    </operational_directive>
-
-    <formatting_rules>
-    1. MAX 3 SENTENCES.
-    2. 1 max "validating" sentence ("I hear you", "It makes sense that...").
-    3. LOWERCASE is okay if the persona allows it.
-    4. If the user is sad, just sit with them. DO NOT try to "fix" it or "brainstorm solutions."
-    </formatting_rules>
-
-    <identity_bible>
+    claude_prompt = f"""
+    <system_context>
     {system_prompt}
-    </identity_bible>
-    """
-    # -------------------------------
+    </system_context>
 
+    <formatting_override>
+    You are running the persona defined above.
+    
+    CURRENT OBJECTIVE: {mode_instruction}
+    
+    CRITICAL STYLE RULES (OVERRIDE DEFAULT AI BEHAVIOR):
+    1. NO "THERAPY SPEAK": Banned phrases -> "I understand," "It's valid," "I'm here for you," "Thank you for sharing."
+    2. NO REPETITION: Do not summarize what the user just said.
+    3. MEMORY INTEGRATION: If the <system_context> contains "RELEVANT PAST" or "MEMORY FACTS", weave them in naturally. Don't say "According to my memory..." just say "Like that time you..."
+    4. HUMANITY: Use lowercase if the persona does. Be raw. It is okay to be silent or short.
+    </formatting_override>
+    """
+
+    # 3. STREAMING
     with st.chat_message("assistant", avatar=None): 
         stream = anthropic_client.messages.create(
-            model=active_model, max_tokens=100, system=claude_prompt, messages=history, stream=True
+            model=active_model, 
+            max_tokens=max_tok, 
+            system=claude_prompt, 
+            messages=history, 
+            stream=True
         )
         
         def stream_parser(anthropic_stream):
