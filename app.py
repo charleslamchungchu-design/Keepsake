@@ -138,8 +138,8 @@ def generate_smart_response(system_prompt, history, tier, persona_text=""):
     """
     Hybrid Rerouting:
     - Tier 0/1: GPT-4o Mini (Fast, standard).
-    - Tier 2 (Casual): Claude Haiku (Fast, Witty, Memory-Aware).
-    - Tier 2 (Deep): Claude Sonnet (Nuanced, Emotional, High EQ).
+    - Tier 2 (Casual): Claude Haiku (Fast, Witty).
+    - Tier 2 (Deep): Claude Sonnet (Nuanced, Emotional).
     """
     
     # --- TRACK A: GPT-4o Mini (Tier 0 & 1) ---
@@ -150,31 +150,38 @@ def generate_smart_response(system_prompt, history, tier, persona_text=""):
     # --- TRACK B: ANTHROPIC (Tier 2) ---
     last_msg = history[-1]['content'].lower()
     
-    # 1. TRIGGER LOGIC: Differentiate "Chat" vs "Deep Work"
-    # Added subtle emotional triggers, not just "crisis" words.
+    # 1. TRIGGER LOGIC
     deep_triggers = [
-        "upset", "anxious", "depressed", "why", "analyze", "lonely", 
-        "divorce", "lost my job", "fired", "scared", "worry", "relationship",
-        "perspective", "advice"
+        "upset", "anxious", "depressed", "why", "explain", "analyze", "lonely", 
+        "divorce", "lost my job", "fired", "scared", "worry", "relationship", "perspective", "advice"
     ]
     
     is_deep = any(t in last_msg for t in deep_triggers) or len(last_msg) > 60
     
     if is_deep:
         active_model = "claude-3-5-sonnet-20240620"
-        mode_instruction = "MODE: DEEP RESONANCE. Read between the lines. Connect current stress to PAST MEMORIES if available. Be psychological, not clinical."
-        max_tok = 300 # Allow depth
+        mode_instruction = "MODE: DEEP RESONANCE. Connect current stress to PAST MEMORIES. Be psychological, not clinical."
+        max_tok = 300 
     else:
         active_model = "claude-3-haiku-20240307"
-        mode_instruction = "MODE: CASUAL BANTER. React quickly. Be witty or chill. Keep it to 1 sentence usually."
-        max_tok = 100 # Force brevity
+        mode_instruction = "MODE: CASUAL BANTER. React quickly. Be witty. Keep it to 1 sentence."
+        max_tok = 100 
 
     print(f"🔎 DEBUG: Tier {tier} | Model: {active_model}")
 
-    # 2. THE CLAUDE WRAPPER (The Fix)
-    # We wrap your existing 'system_prompt' (which has RAG + Persona) in XML 
-    # to force Claude to prioritize IDENTITY over SAFETY.
+    # 2. SANITIZATION (CRITICAL FIX FOR ANTHROPIC)
+    # Anthropic crashes if the list starts with "Assistant" or contains "System".
+    claude_msgs = [m for m in history if m['role'] != 'system']
     
+    # Ensure the first message is from User. If not, remove the first item.
+    while len(claude_msgs) > 0 and claude_msgs[0]['role'] == 'assistant':
+        claude_msgs.pop(0)
+        
+    # Safety catch: If history is empty after cleaning, add a dummy user msg to prevent crash
+    if not claude_msgs:
+        claude_msgs = [{"role": "user", "content": "..."}]
+
+    # 3. THE CLAUDE WRAPPER
     claude_prompt = f"""
     <system_context>
     {system_prompt}
@@ -182,24 +189,23 @@ def generate_smart_response(system_prompt, history, tier, persona_text=""):
 
     <formatting_override>
     You are running the persona defined above.
-    
     CURRENT OBJECTIVE: {mode_instruction}
     
-    CRITICAL STYLE RULES (OVERRIDE DEFAULT AI BEHAVIOR):
-    1. NO "THERAPY SPEAK": Banned phrases -> "I understand," "It's valid," "I'm here for you," "Thank you for sharing."
-    2. NO REPETITION: Do not summarize what the user just said.
-    3. MEMORY INTEGRATION: If the <system_context> contains "RELEVANT PAST" or "MEMORY FACTS", weave them in naturally. Don't say "According to my memory..." just say "Like that time you..."
-    4. HUMANITY: Use lowercase if the persona does. Be raw. It is okay to be silent or short.
+    CRITICAL STYLE RULES:
+    1. NO "THERAPY SPEAK" (Banned: "I understand," "It's valid," "I'm here for you").
+    2. NO REPETITION.
+    3. MEMORY INTEGRATION: Weave in relevant past details naturally.
+    4. HUMANITY: Use lowercase if the persona does. Be raw.
     </formatting_override>
     """
 
-    # 3. STREAMING
+    # 4. STREAMING
     with st.chat_message("assistant", avatar=None): 
         stream = anthropic_client.messages.create(
             model=active_model, 
             max_tokens=max_tok, 
             system=claude_prompt, 
-            messages=history, 
+            messages=claude_msgs, # <--- Sending the CLEAN list
             stream=True
         )
         
