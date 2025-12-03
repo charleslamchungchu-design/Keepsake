@@ -449,6 +449,12 @@ else: # CHAT ROOM
             save_memory(memory); st.rerun()
         if st.button("👶 New User"): 
             memory['history'] = memory['history'][-5:]; save_memory(memory); st.rerun()
+        if st.button("💎 Force Upgrade"):
+            memory['tier'] = 1
+            save_memory(memory)
+            st.success("Upgraded to Tier 1")
+            time.sleep(1)
+            st.rerun()
         if st.checkbox("🧠 Show Brain"):
             st.write("**Events:**"); st.json(memory.get('active_context', {}))
             st.write("**Facts:**"); st.json(memory.get('user_facts', []))
