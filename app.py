@@ -6,6 +6,7 @@ import time
 import random
 from datetime import datetime, timedelta
 from openai import OpenAI
+from anthropic import Anthropic # NEW: Anthropic Import
 from supabase import create_client, Client # NEW: Supabase Import
 
 # --- 1. SETUP & PATHS ---
@@ -46,6 +47,7 @@ except Exception as e:
     print(f"Supabase Connection Error: {e}")
 
 client = OpenAI(api_key=OPENAI_KEY)
+anthropic_client = Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"]) # NEW: Client Init
 
 # We use a fixed ID for now to simulate the single local file experience
 USER_ID = "user_1" 
@@ -115,6 +117,46 @@ if "current_vibe" not in st.session_state: st.session_state.current_vibe = 50
 if "turbo_teaser_shown" not in st.session_state: st.session_state.turbo_teaser_shown = False
 if "future_teaser_shown" not in st.session_state: st.session_state.future_teaser_shown = False
 # --- 4. LOGIC FUNCTIONS ---
+# --- NEW: RAG & REROUTING LOGIC ---
+def save_vector_memory(text):
+    """Embeds and saves user text to Supabase for long-term recall."""
+    try:
+        emb = client.embeddings.create(input=text, model="text-embedding-3-small").data[0].embedding
+        supabase.table("recall_vectors").insert({"user_id": USER_ID, "content": text, "embedding": emb}).execute()
+    except Exception: pass
+
+def retrieve_context(query):
+    """RAG: Finds relevant past memories based on the current conversation."""
+    try:
+        emb = client.embeddings.create(input=query, model="text-embedding-3-small").data[0].embedding
+        res = supabase.rpc("match_vectors", {"query_embedding": emb, "match_threshold": 0.5, "match_count": 3, "filter_user": USER_ID}).execute()
+        return "\n".join([f"- {item['content']}" for item in res.data])
+    except Exception: return ""
+
+def generate_smart_response(system_prompt, history, tier):
+    """Reroutes between GPT-4o and Claude 3.5 based on Tier and Complexity."""
+    # TIER 0 & 1: OpenAI (GPT-4o Mini for speed/cost, or standard 4o if preferred)
+    if tier < 2:
+        msgs = [{"role": "system", "content": system_prompt}] + history
+        return st.write_stream(client.chat.completions.create(model="gpt-4o-mini", messages=msgs, stream=True))
+
+    # TIER 2: Anthropic (Claude) - Rerouting Logic
+    last_msg = history[-1]['content'].lower()
+    triggers = ["upset", "anxious", "depressed", "why", "explain", "analyze", "lonely"]
+    
+    # Complex/Emotional -> Sonnet (Smartest); Casual -> Haiku (Fastest)
+    if any(t in last_msg for t in triggers) or len(last_msg) > 80:
+        active_model = "claude-3-5-sonnet-20240620"
+    else:
+        active_model = "claude-3-haiku-20240307"
+    print(f"🔎 DEBUG: Tier {tier} | Model: {active_model}")
+    with st.chat_message("assistant", avatar=None): # Stream handling for Claude
+        stream = anthropic_client.messages.create(
+            model=active_model, max_tokens=400, system=system_prompt, messages=history, stream=True
+        )
+        return st.write_stream(stream)
+    
+
 def get_emotional_value(scores, current_input):
     """Determines the psychological value strategy and Ending Protocol."""
     
@@ -528,7 +570,13 @@ else: # CHAT ROOM
             scene_desc = f"SCENE: Casual. {weekly_instr}"
 
         facts_list = "\n".join(memory.get('user_facts', []))
-        recall_instr = f"MEMORY: {facts_list}" if facts_list else ""
+
+        # NEW: RAG Context Retrieval (Tier 1+)
+        rag_context = ""
+        if memory.get('tier', 0) >= 1:
+            rag_context = retrieve_context
+
+        recall_instr = f"MEMORY FACTS:\n{facts_list}\nRELEVANT PAST:\n{rag_context}"
         
         # 4. DISPLAY & INPUT
                 # Filter out system messages so we only count visible chat lines
@@ -651,24 +699,23 @@ else: # CHAT ROOM
             {tone_anchor_block}
             """
 
-            # GENERATION (OPENAI ONLY FOR STABILITY)
-            full_messages = [{"role": "system", "content": system_prompt}] + memory['history'][-10:]
-            
+        # NEW: Rerouting Generation (GPT-4o or Claude based on Tier)
             with st.chat_message("assistant", avatar=avatar_file):
                 bubble = st.empty()
-                time.sleep(random.uniform(1, 2)); bubble.markdown("... *typing*")
-                if time_of_day == "Late Night": time.sleep(random.uniform(2, 4))
-                else: time.sleep(random.uniform(1.5, 2.5))
+                bubble.markdown("... *typing*")
+                # Simple typing delay
+                time.sleep(random.uniform(1.5, 2.5))
                 bubble.empty()
                 
-                stream = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=full_messages,
-                    stream=True
-                )
-                response = st.write_stream(stream)
+                # Call the smart rerouting function
+                response = generate_smart_response(system_prompt, memory['history'][-10:], memory.get('tier', 0))
+
+            # NEW: Save significant inputs to Vector DB (Tier 1+)
+            if len(prompt) > 20 and memory.get('tier', 0) >= 1:
+                save_vector_memory(prompt)
             
             memory['history'].append({"role": "assistant", "content": response})
+            
             
             # Reverse Agency Gift
             if memory['emotional_state']['agency'] > 20 and random.random() < 0.1:
