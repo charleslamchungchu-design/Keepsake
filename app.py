@@ -137,16 +137,16 @@ def retrieve_context(query):
 def generate_smart_response(system_prompt, history, tier):
     """Reroutes between GPT-4o and Claude 3.5 based on Tier and Complexity."""
     
-    # TIER 0 & 1: OpenAI (Native compatibility with Streamlit)
+    # TIER 0 & 1: OpenAI (GPT-4o Mini)
+    # GPT handles raw prompts well, so we keep this simple to avoid breaking it.
     if tier < 2:
         msgs = [{"role": "system", "content": system_prompt}] + history
         return st.write_stream(client.chat.completions.create(model="gpt-4o-mini", messages=msgs, stream=True))
 
-    # TIER 2: Anthropic (Claude) - Rerouting Logic
+    # TIER 2: Anthropic (Claude 3.5) - Persona Hardening
     last_msg = history[-1]['content'].lower()
     triggers = ["upset", "anxious", "depressed", "why", "explain", "analyze", "lonely"]
     
-    # Complex/Emotional -> Sonnet (Smartest); Casual -> Haiku (Fastest)
     if any(t in last_msg for t in triggers) or len(last_msg) > 80:
         active_model = "claude-3-5-sonnet-20240620"
     else:
@@ -154,19 +154,35 @@ def generate_smart_response(system_prompt, history, tier):
 
     print(f"🔎 DEBUG: Tier {tier} | Model: {active_model}")
 
+    # --- CLAUDE IDENTITY WRAPPER ---
+    # We frame the instruction as a "Fictional Writing Task" to ensure immersion.
+    claude_prompt = f"""
+    <operational_directive>
+    You are participating in a fictional creative writing exercise.
+    Your goal is to embody the specific character defined in the <identity_bible> tags.
+    RULES:
+    1. You are NOT an AI assistant. You are the character.
+    2. Do not be "helpful" or "polite" unless the character profile explicitly says so.
+    3. Adopt the gender, tone, and vocabulary defined below immediately.
+    4. Never break character or mention you are a model.
+    </operational_directive>
+
+    <identity_bible>
+    {system_prompt}
+    </identity_bible>
+    """
+    # -------------------------------
+
     with st.chat_message("assistant", avatar=None): 
-        # 1. Get the raw stream from Anthropic
         stream = anthropic_client.messages.create(
-            model=active_model, max_tokens=400, system=system_prompt, messages=history, stream=True
+            model=active_model, max_tokens=400, system=claude_prompt, messages=history, stream=True
         )
         
-        # 2. ADAPTER: Helper to extract ONLY text from the raw events
         def stream_parser(anthropic_stream):
             for event in anthropic_stream:
                 if event.type == "content_block_delta":
                     yield event.delta.text
 
-        # 3. Pass the CLEAN text to Streamlit
         return st.write_stream(stream_parser(stream))
     
 
