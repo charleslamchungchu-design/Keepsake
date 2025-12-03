@@ -112,6 +112,7 @@ def save_memory(memory_data):
         st.error(f"Error saving to cloud: {e}")
 
 memory = load_memory()
+memory['tier'] = 2  # TEMP: Force Tier 2 for testing
 if "app_mode" not in st.session_state: st.session_state.app_mode = "Lobby"
 if "current_vibe" not in st.session_state: st.session_state.current_vibe = 50
 if "turbo_teaser_shown" not in st.session_state: st.session_state.turbo_teaser_shown = False
