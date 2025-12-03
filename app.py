@@ -185,7 +185,7 @@ def generate_smart_response(system_prompt, history, tier):
 
     with st.chat_message("assistant", avatar=None): 
         stream = anthropic_client.messages.create(
-            model=active_model, max_tokens=400, system=claude_prompt, messages=history, stream=True
+            model=active_model, max_tokens=100, system=claude_prompt, messages=history, stream=True
         )
         
         def stream_parser(anthropic_stream):
