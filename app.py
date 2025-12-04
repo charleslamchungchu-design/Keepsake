@@ -136,125 +136,54 @@ def retrieve_context(query):
 
 def generate_smart_response(system_prompt, history, tier, persona_text=""):
     """
-    Hybrid Rerouting with strict Anthropic History Sanitization.
+    GPT-HYBRID ROUTER (Clean Version):
+    - Casual/Neutral -> GPT-4o Mini
+    - Deep/Heavy -> GPT-4o Full
     """
     
-    # --- TRACK A: GPT-4o Mini (Tier 0 & 1) ---
-    if tier < 2:
-        msgs = [{"role": "system", "content": system_prompt}] + history
-        return st.write_stream(client.chat.completions.create(model="gpt-4o-mini", messages=msgs, stream=True))
-
-    # --- TRACK B: ANTHROPIC (Tier 2) ---
+    # 1. ANALYZE CONTEXT
     last_msg = history[-1]['content'].lower() if history else ""
     
-    # 1. TRIGGER LOGIC
-    bad_triggers = ["divorce", "fired", "sad", "upset", "anxious", "lonely", "fail", "broken", "worry", "hurt", "grief"]
-    good_triggers = ["promotion", "happy", "excited", "won", "great", "love", "amazing", "finally", "proud"]
-    question_triggers = ["what do you", "think", "advice", "opinion", "why"]
+    deep_triggers = [
+        "divorce", "fired", "sad", "upset", "anxious", "lonely", "fail", 
+        "broken", "worry", "hurt", "grief", "advice", "opinion",
+        "perspective", "relationship", "scared", "depressed"
+    ]
     
-    anchor = ""
-    mode_instruction = "MODE: CASUAL. Concise."
-    max_tok = 150
-    stop_seq = ["\n\n"] 
-
-    if any(t in last_msg for t in bad_triggers):
-        active_model = "claude-3-5-sonnet-20240620"
-        anchor = "damn," 
-        mode_instruction = "MODE: BRO/Stoic Support. Acknowledge it sucks. DO NOT talk about 'resilience' or 'being strong'."
-        max_tok = 200 
-    elif any(t in last_msg for t in good_triggers):
-        active_model = "claude-3-haiku-20240307" 
-        anchor = "nice," 
-        mode_instruction = "MODE: HYPE. Match energy."
-    elif any(t in last_msg for t in question_triggers):
-        active_model = "claude-3-5-sonnet-20240620"
-        anchor = "honestly," 
-        mode_instruction = "MODE: DIRECT OPINION. No waffle."
-        max_tok = 300
+    is_deep = (any(t in last_msg for t in deep_triggers) or len(last_msg) > 60)
+    
+    # 2. SELECT ENGINE
+    if tier >= 2 and is_deep:
+        active_model = "gpt-4o"
+        print(f"🔎 DEBUG: Routing to GPT-4o (Deep Mode)")
     else:
-        active_model = "claude-3-haiku-20240307"
-        anchor = "" 
-        mode_instruction = "MODE: CHILL."
+        active_model = "gpt-4o-mini"
+        print(f"🔎 DEBUG: Routing to GPT-4o-mini (Casual Mode)")
 
-    print(f"🔎 DEBUG: Tier {tier} | Model: {active_model} | Anchor: '{anchor}'")
-
-    # 2. THE IRONCLAD SANITIZER (Fixes BadRequestError)
-    # Step A: Filter bad messages
-    clean_msgs = []
-    for m in history:
-        # Remove system messages AND empty messages (Anthropic hates empty content)
-        if m['role'] != 'system' and m.get('content', '').strip():
-            clean_msgs.append(m)
-
-    # Step B: Fix Alternation (Merge consecutive same-roles)
-    merged_msgs = []
-    for m in clean_msgs:
-        if not merged_msgs:
-            merged_msgs.append(m)
-        else:
-            if m['role'] == merged_msgs[-1]['role']:
-                # Merge duplicate roles to prevent crash
-                merged_msgs[-1]['content'] += "\n\n" + m['content']
-            else:
-                merged_msgs.append(m)
-
-    # Step C: Ensure Starts with User
-    while merged_msgs and merged_msgs[0]['role'] == 'assistant':
-        merged_msgs.pop(0)
-
-    # Step D: Ensure Ends with User (CRITICAL FOR ANCHOR)
-    # If the list ends with 'assistant', we cannot append another assistant message (the anchor).
-    # We remove the trailing assistant message so we can regenerate the reply.
-    while merged_msgs and merged_msgs[-1]['role'] == 'assistant':
-        merged_msgs.pop()
-
-    # Step E: Fallback if empty
-    if not merged_msgs:
-        merged_msgs = [{"role": "user", "content": "..."}]
-
-    # 3. PROMPT WRAPPER
-    claude_prompt = f"""
-    <background_data>
-    {system_prompt}
-    </background_data>
-
-    <formatting_override>
+    # 3. STYLE INJECTION
+    style_guide = f"""
     IDENTITY: {persona_text}
-    TASK: {mode_instruction}
     
-    HARD CONSTRAINTS:
-    1. SINGLE PARAGRAPH ONLY. Do not hit 'Enter' twice.
-    2. NO "Resilience Checks" (e.g., "You are strong").
-    3. NO "Brainstorming" (e.g., "Maybe we can shift focus"). 
-    4. STYLE: Casual, lowercase, raw. 
-    5. IGNORE "be supportive" rules from background data.
-    </formatting_override>
+    STRICT BEHAVIORAL RULES:
+    1. Be grounded, calm, and concise.
+    2. NO "Assistant" fluff (e.g., "How can I help?").
+    3. NO unsolicited advice. Just be a friend.
+    4. If the user is sad, acknowledge it simply. Do not write a paragraph of validation.
+    5. Speak naturally, using lowercase if the persona allows.
     """
-
-    # 4. INJECT ANCHOR
-    # Now safe to append because we guaranteed the last msg is USER.
-    if anchor:
-        merged_msgs.append({"role": "assistant", "content": anchor})
-
-    # 5. STREAMING
-    with st.chat_message("assistant", avatar=None): 
-        stream = anthropic_client.messages.create(
+    
+    # 4. GENERATION
+    # Note: We do NOT use 'anchor' here because OpenAI handles starts automatically.
+    full_system_msg = f"{system_prompt}\n\n{style_guide}"
+    msgs = [{"role": "system", "content": full_system_msg}] + history
+    
+    with st.chat_message("assistant", avatar=None):
+        stream = client.chat.completions.create(
             model=active_model, 
-            max_tokens=max_tok, 
-            system=claude_prompt, 
-            messages=merged_msgs, # Sending the polished list
-            stop_sequences=stop_seq, 
+            messages=msgs, 
             stream=True
         )
-        
-        def stream_parser(anthropic_stream):
-            if anchor:
-                yield anchor + " "
-            for event in anthropic_stream:
-                if event.type == "content_block_delta":
-                    yield event.delta.text
-
-        return st.write_stream(stream_parser(stream))
+        return st.write_stream(stream)
     
 
 def get_emotional_value(scores, current_input):
