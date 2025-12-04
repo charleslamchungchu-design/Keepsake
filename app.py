@@ -136,8 +136,7 @@ def retrieve_context(query):
 
 def generate_smart_response(system_prompt, history, tier, persona_text=""):
     """
-    Hybrid Rerouting with Dynamic Anchoring:
-    - Analyzes Sentiment -> Picks a "Soft Start" (Anchor) -> Forces Claude to match tone.
+    Hybrid Rerouting with Dynamic Anchoring, Structure Control, and Crash Prevention.
     """
     
     # --- TRACK A: GPT-4o Mini (Tier 0 & 1) ---
@@ -148,65 +147,76 @@ def generate_smart_response(system_prompt, history, tier, persona_text=""):
     # --- TRACK B: ANTHROPIC (Tier 2) ---
     last_msg = history[-1]['content'].lower()
     
-    # 1. DEFINE TRIGGERS & ANCHORS
-    # Triggers help us decide IF we need a pre-fill. 
-    # Anchors are the actual words we force into the bot's mouth.
-    
+    # 1. TRIGGER LOGIC
     bad_triggers = ["divorce", "fired", "sad", "upset", "anxious", "lonely", "fail", "broken", "worry", "hurt", "grief"]
     good_triggers = ["promotion", "happy", "excited", "won", "great", "love", "amazing", "finally", "proud"]
     question_triggers = ["what do you", "think", "advice", "opinion", "why"]
     
     anchor = ""
-    mode_instruction = "MODE: CASUAL. Be concise."
+    mode_instruction = "MODE: CASUAL. Concise."
     max_tok = 150
+    stop_seq = ["\n\n"] 
 
-    # Logic: Pick the anchor based on sentiment
     if any(t in last_msg for t in bad_triggers):
         active_model = "claude-3-5-sonnet-20240620"
-        anchor = "damn," # Forces empathy without "I'm sorry"
-        mode_instruction = "MODE: DEEP RESONANCE. Validate the pain, but do NOT offer solutions. Be raw."
-        max_tok = 300
+        anchor = "damn," 
+        mode_instruction = "MODE: BRO/Stoic Support. Acknowledge it sucks. DO NOT talk about 'resilience' or 'being strong'."
+        max_tok = 200 
     elif any(t in last_msg for t in good_triggers):
-        active_model = "claude-3-haiku-20240307" # Haiku is great for hype
-        anchor = "nice," # Forces celebration without "That's wonderful news!"
-        mode_instruction = "MODE: HYPE. Match their energy. High five."
+        active_model = "claude-3-haiku-20240307" 
+        anchor = "nice," 
+        mode_instruction = "MODE: HYPE. Match energy."
     elif any(t in last_msg for t in question_triggers):
-        active_model = "claude-3-5-sonnet-20240620" # Sonnet for advice
-        anchor = "honestly," # Forces a direct opinion
-        mode_instruction = "MODE: ADVISOR. Give a straight answer. No preamble."
+        active_model = "claude-3-5-sonnet-20240620"
+        anchor = "honestly," 
+        mode_instruction = "MODE: DIRECT OPINION. No waffle."
         max_tok = 300
     else:
-        # NEUTRAL / CHAT
         active_model = "claude-3-haiku-20240307"
-        anchor = "" # No anchor needed for "How are you?", let the Persona handle it.
-        mode_instruction = "MODE: CHILL. One sentence reply."
+        anchor = "" 
+        mode_instruction = "MODE: CHILL."
 
     print(f"🔎 DEBUG: Tier {tier} | Model: {active_model} | Anchor: '{anchor}'")
 
-    # 2. SANITIZATION
-    claude_msgs = [m for m in history if m['role'] != 'system']
+    # 2. ADVANCED SANITIZATION (Prevents the Crash)
+    # Step A: Remove system messages
+    raw_msgs = [m for m in history if m['role'] != 'system']
+    
+    # Step B: Ensure alternating roles (User -> Assistant -> User). 
+    # Anthropic crashes if we have (User -> User). We merge them here.
+    claude_msgs = []
+    for msg in raw_msgs:
+        if not claude_msgs:
+            claude_msgs.append(msg)
+        else:
+            if msg['role'] == claude_msgs[-1]['role']:
+                # Merge duplicate roles to prevent crash
+                claude_msgs[-1]['content'] += "\n\n" + msg['content']
+            else:
+                claude_msgs.append(msg)
+
+    # Step C: Ensure starts with User
     while len(claude_msgs) > 0 and claude_msgs[0]['role'] == 'assistant':
         claude_msgs.pop(0)
+        
     if not claude_msgs: claude_msgs = [{"role": "user", "content": "..."}]
 
-    # 3. PROMPT WRAPPER (The "Data Only" Strategy)
-    # We strip the "Therapist" instructions by labeling the old prompt as "Background Data"
+    # 3. PROMPT WRAPPER
     claude_prompt = f"""
-    <background_data_for_reference_only>
+    <background_data>
     {system_prompt}
-    </background_data_for_reference_only>
+    </background_data>
 
     <formatting_override>
-    You are running the persona defined above.
-    
+    IDENTITY: {persona_text}
     TASK: {mode_instruction}
     
-    STRICT RULES:
-    1. IGNORE behavioral instructions in the background data (e.g., "be supportive"). 
-    2. USE THE DATA: Connect the user's input to the facts/memories in <background_data_for_reference_only>.
-    3. NO "THERAPY SPEAK": Banned -> "I understand," "It's valid," "I'm here for you."
-    4. NO PREAMBLE: Start directly.
-    5. STYLE: Lowercase (unless persona forbids).
+    HARD CONSTRAINTS:
+    1. SINGLE PARAGRAPH ONLY. Do not hit 'Enter' twice.
+    2. NO "Resilience Checks" (e.g., "You are strong").
+    3. NO "Brainstorming" (e.g., "Maybe we can shift focus"). 
+    4. STYLE: Casual, lowercase, raw. 
+    5. IGNORE "be supportive" rules from background data.
     </formatting_override>
     """
 
@@ -221,6 +231,7 @@ def generate_smart_response(system_prompt, history, tier, persona_text=""):
             max_tokens=max_tok, 
             system=claude_prompt, 
             messages=claude_msgs, 
+            stop_sequences=stop_seq, 
             stream=True
         )
         
@@ -791,7 +802,7 @@ else: # CHAT ROOM
                 bubble.empty()
                 
                 # Call the smart rerouting function
-                response = generate_smart_response(system_prompt, memory['history'][-10:], memory.get('tier', 0))
+                response = generate_smart_response(system_prompt, memory['history'][-10:], memory.get('tier', 0), persona_text=active_persona)
 
             # NEW: Save significant inputs to Vector DB (Tier 1+)
             if len(prompt) > 20 and memory.get('tier', 0) >= 1:
