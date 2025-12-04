@@ -136,7 +136,7 @@ def retrieve_context(query):
 
 def generate_smart_response(system_prompt, history, tier, persona_text=""):
     """
-    Hybrid Rerouting with Dynamic Anchoring, Structure Control, and Crash Prevention.
+    Hybrid Rerouting with strict Anthropic History Sanitization.
     """
     
     # --- TRACK A: GPT-4o Mini (Tier 0 & 1) ---
@@ -145,7 +145,7 @@ def generate_smart_response(system_prompt, history, tier, persona_text=""):
         return st.write_stream(client.chat.completions.create(model="gpt-4o-mini", messages=msgs, stream=True))
 
     # --- TRACK B: ANTHROPIC (Tier 2) ---
-    last_msg = history[-1]['content'].lower()
+    last_msg = history[-1]['content'].lower() if history else ""
     
     # 1. TRIGGER LOGIC
     bad_triggers = ["divorce", "fired", "sad", "upset", "anxious", "lonely", "fail", "broken", "worry", "hurt", "grief"]
@@ -178,28 +178,39 @@ def generate_smart_response(system_prompt, history, tier, persona_text=""):
 
     print(f"🔎 DEBUG: Tier {tier} | Model: {active_model} | Anchor: '{anchor}'")
 
-    # 2. ADVANCED SANITIZATION (Prevents the Crash)
-    # Step A: Remove system messages
-    raw_msgs = [m for m in history if m['role'] != 'system']
-    
-    # Step B: Ensure alternating roles (User -> Assistant -> User). 
-    # Anthropic crashes if we have (User -> User). We merge them here.
-    claude_msgs = []
-    for msg in raw_msgs:
-        if not claude_msgs:
-            claude_msgs.append(msg)
-        else:
-            if msg['role'] == claude_msgs[-1]['role']:
-                # Merge duplicate roles to prevent crash
-                claude_msgs[-1]['content'] += "\n\n" + msg['content']
-            else:
-                claude_msgs.append(msg)
+    # 2. THE IRONCLAD SANITIZER (Fixes BadRequestError)
+    # Step A: Filter bad messages
+    clean_msgs = []
+    for m in history:
+        # Remove system messages AND empty messages (Anthropic hates empty content)
+        if m['role'] != 'system' and m.get('content', '').strip():
+            clean_msgs.append(m)
 
-    # Step C: Ensure starts with User
-    while len(claude_msgs) > 0 and claude_msgs[0]['role'] == 'assistant':
-        claude_msgs.pop(0)
-        
-    if not claude_msgs: claude_msgs = [{"role": "user", "content": "..."}]
+    # Step B: Fix Alternation (Merge consecutive same-roles)
+    merged_msgs = []
+    for m in clean_msgs:
+        if not merged_msgs:
+            merged_msgs.append(m)
+        else:
+            if m['role'] == merged_msgs[-1]['role']:
+                # Merge duplicate roles to prevent crash
+                merged_msgs[-1]['content'] += "\n\n" + m['content']
+            else:
+                merged_msgs.append(m)
+
+    # Step C: Ensure Starts with User
+    while merged_msgs and merged_msgs[0]['role'] == 'assistant':
+        merged_msgs.pop(0)
+
+    # Step D: Ensure Ends with User (CRITICAL FOR ANCHOR)
+    # If the list ends with 'assistant', we cannot append another assistant message (the anchor).
+    # We remove the trailing assistant message so we can regenerate the reply.
+    while merged_msgs and merged_msgs[-1]['role'] == 'assistant':
+        merged_msgs.pop()
+
+    # Step E: Fallback if empty
+    if not merged_msgs:
+        merged_msgs = [{"role": "user", "content": "..."}]
 
     # 3. PROMPT WRAPPER
     claude_prompt = f"""
@@ -221,8 +232,9 @@ def generate_smart_response(system_prompt, history, tier, persona_text=""):
     """
 
     # 4. INJECT ANCHOR
+    # Now safe to append because we guaranteed the last msg is USER.
     if anchor:
-        claude_msgs.append({"role": "assistant", "content": anchor})
+        merged_msgs.append({"role": "assistant", "content": anchor})
 
     # 5. STREAMING
     with st.chat_message("assistant", avatar=None): 
@@ -230,7 +242,7 @@ def generate_smart_response(system_prompt, history, tier, persona_text=""):
             model=active_model, 
             max_tokens=max_tok, 
             system=claude_prompt, 
-            messages=claude_msgs, 
+            messages=merged_msgs, # Sending the polished list
             stop_sequences=stop_seq, 
             stream=True
         )
