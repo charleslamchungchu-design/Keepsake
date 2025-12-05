@@ -16,15 +16,18 @@ PROMPTS_DIR = os.path.join(BASE_DIR, "prompts")
 def get_asset_path(filename):
     return os.path.join(BASE_DIR, "assets", filename)
 
+@st.cache_data
 def load_prompt(filename):
+    """Loads prompt file from disk. Cached to avoid repeated file reads."""
     try:
         with open(os.path.join(PROMPTS_DIR, filename), "r", encoding="utf-8") as f:
             return f.read().strip()
     except FileNotFoundError:
-        st.error(f"Error: Could not find prompt file: {filename}")
         return ""
 
+@st.cache_data
 def load_json(filename):
+    """Loads JSON file from disk. Cached to avoid repeated file reads."""
     try:
         with open(os.path.join(PROMPTS_DIR, filename), "r", encoding="utf-8") as f:
             return json.load(f)
@@ -32,24 +35,31 @@ def load_json(filename):
         return {}
 
 # --- 2. CONFIGURATION (OpenAI & Supabase) ---
-try:
-    OPENAI_KEY = st.secrets.get("OPENAI_API_KEY")
-except:
-    OPENAI_KEY = "LOCAL-DEV-KEY"
+# PERFORMANCE: Use @st.cache_resource to create clients ONCE, not on every rerun
 
-# Supabase Connection Setup
-# Using a flag to track if Supabase is available (prevents crashes if not configured)
-SUPABASE_AVAILABLE = False
-supabase = None
-try:
-    SUPABASE_URL = st.secrets["supabase"]["SUPABASE_URL"]
-    SUPABASE_KEY = st.secrets["supabase"]["SUPABASE_KEY"]
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    SUPABASE_AVAILABLE = True
-except Exception as e:
-    print(f"Supabase Connection Error (non-fatal): {e}")
+@st.cache_resource
+def get_openai_client():
+    """Creates OpenAI client once and reuses across reruns."""
+    try:
+        key = st.secrets.get("OPENAI_API_KEY")
+    except:
+        key = "LOCAL-DEV-KEY"
+    return OpenAI(api_key=key)
 
-client = OpenAI(api_key=OPENAI_KEY)
+@st.cache_resource
+def get_supabase_client():
+    """Creates Supabase client once and reuses across reruns."""
+    try:
+        url = st.secrets["supabase"]["SUPABASE_URL"]
+        key = st.secrets["supabase"]["SUPABASE_KEY"]
+        return create_client(url, key), True
+    except Exception as e:
+        print(f"Supabase Connection Error (non-fatal): {e}")
+        return None, False
+
+# Initialize clients (cached - only runs once per session)
+client = get_openai_client()
+supabase, SUPABASE_AVAILABLE = get_supabase_client()
 
 # NOTE: Anthropic client removed - not currently used in this codebase
 # If you plan to use Claude, uncomment and configure:
@@ -131,8 +141,14 @@ def save_memory(memory_data):
     except Exception as e:
         print(f"Supabase save error (non-fatal): {e}")
 
-memory = load_memory()
-memory['tier'] = 2  # TEMP: Force Tier 2 for testing
+# PERFORMANCE FIX: Store memory in session_state to avoid DB calls on every rerun
+# Only loads from Supabase ONCE per session, then uses cached version
+if "memory" not in st.session_state:
+    st.session_state.memory = load_memory()
+    st.session_state.memory['tier'] = 2  # TEMP: Force Tier 2 for testing
+
+# Use session state memory (fast - no network call)
+memory = st.session_state.memory
 
 if "app_mode" not in st.session_state: st.session_state.app_mode = "Lobby"
 if "current_vibe" not in st.session_state: st.session_state.current_vibe = 50
@@ -200,23 +216,70 @@ def generate_smart_response(system_prompt, history, tier, should_ask_question=Tr
     else:
         active_model = "gpt-4o-mini" 
 
-    # 3. STYLE ENFORCEMENT (Contextual - respects question permissions)
-    # FIX: This now respects the should_ask_question flag instead of always asking
-    if should_ask_question:
-        question_guidance = "If the conversation has momentum, you may ask ONE specific follow-up question about their feelings (not logistics)."
+    # 3. STYLE ENFORCEMENT (Contextual - respects question permissions + depth)
+    # This now implements the "Bridge Pattern" and "Matrix Escalation" rules
+    
+    # MATRIX ESCALATION: When is_deep triggers, authorize longer, deeper responses
+    if is_deep:
+        depth_instruction = """
+=== MATRIX ESCALATION ACTIVE ===
+Strong emotion detected. You are AUTHORIZED to "Go Hard."
+- DROP the brevity constraint. This moment deserves a full, complex response.
+- Consult the EMOTIONAL MATRIX. Identify the user's state (COLD, HOT, SPINNING, RADIANT, HOLLOW).
+- Deliver the COUNTER-WEIGHT with full intensity (Protection, Comfort, Amplification, or Presence).
+- Lead with RAW REACTION before anything else. Show you FELT their message.
+- This is not the time for small talk. Go deep."""
     else:
-        question_guidance = "DO NOT ask questions. Use comforting statements and validation only."
+        depth_instruction = ""
+    
+    # BRIDGE PATTERN: Structure for meaningful follow-up questions
+    if should_ask_question:
+        question_guidance = """
+=== THE BRIDGE PATTERN (How to Ask Questions) ===
+When responding to a statement of fact, use this 3-step structure:
+
+STEP 1 - THE REACTION (Required): 
+    Open with a DISTINCT opinion or emotion. Not neutral. Take a side.
+    Good: "Damn, that sounds rough" / "Wait, hold on—that doesn't track"
+    Bad: "I see" / "That's interesting" / "I hear you"
+
+STEP 2 - THE BRIDGE (Required):
+    Connect your reaction to THEIR specific context. Reference something they said.
+
+STEP 3 - THE HOOK (Optional but encouraged):
+    Ask ONE specific question DERIVED from your reaction in Step 1.
+    The question must feel like a natural consequence of your emotional response.
+
+EXAMPLES:
+❌ BAD: "I'm sorry to hear that. How do you feel?" (Generic, no reaction)
+❌ BAD: "That sounds hard. What happened next?" (Weak reaction, interrogation-style)
+
+✅ GOOD (Negative): "Oh damn, that's not looking good at all. Did that catch you completely off guard, or did you see it coming?"
+✅ GOOD (Confused): "Wait—that actually doesn't make sense to me either. What do you make of it?"
+✅ GOOD (Celebratory): "OMG that is HUGE. I'm mentally filing this under 'wins.' Tell me exactly how it went down."
+✅ GOOD (Curious): "Okay hold on, I need more context here. What was going through your head when that happened?"
+
+The question must feel EARNED by your reaction, not tacked on."""
+    else:
+        question_guidance = """
+=== NO QUESTIONS MODE ===
+DO NOT ask questions. This is a moment for presence, not inquiry.
+Use comforting statements, validation, and companionship only.
+You can express curiosity through STATEMENTS: "I'd love to hear more about that whenever you're ready."
+But do NOT end with a question mark."""
     
     style_enforcement = f"""
-[FINAL CHECK BEFORE RESPONDING]
-1. Match the user's EMOTIONAL STATE using the Emotional Matrix above.
-2. Follow the 3:1 rule: 3 statements for every 1 question.
-3. Use your persona's VOICE (check tone, texture, vocabulary from your identity section).
-4. Avoid banned phrases: "I understand", "That's interesting", therapy-speak.
-5. {question_guidance}
+[FINAL OUTPUT RULES]
+{depth_instruction}
+{question_guidance}
 
-Now respond naturally as your character would.
-"""
+=== VOICE & ANTI-PATTERNS ===
+1. Use your persona's authentic VOICE (texture, vocabulary, emotional range from identity section).
+2. BANNED PHRASES (never use): "I understand", "That's interesting", "I hear you", "That must be hard", "How does that make you feel?"
+3. Lead with FEELING, not acknowledgment. Your first words should carry emotional weight.
+4. When in doubt: React first, reflect second, question third (if at all).
+
+Now respond AS your character—not as an assistant."""
     
     msgs = [{"role": "system", "content": system_prompt}] + history
     msgs.append({"role": "system", "content": style_enforcement})
@@ -272,34 +335,147 @@ def update_emotional_state(user_text, current_scores):
     for k in current_scores: current_scores[k] = max(0, min(100, current_scores[k]))
     return current_scores
 
-def save_facts_only(new_facts, new_event=None):
+
+# --- TIERED MEMORY SYSTEM ---
+# Tier 0 (Free): 48-hour memory window
+# Tier 1+: Permanent memory + RAG
+
+def create_timestamped_fact(content):
+    """Creates a fact with timestamp for tiered expiration."""
+    return {
+        "content": content,
+        "created_at": datetime.now().isoformat()
+    }
+
+def migrate_legacy_facts(facts_list):
     """
-    Thread-safe: Saves ONLY new facts to Supabase without overwriting other memory.
-    Loads current state, merges facts, saves back.
+    Migrates old string-format facts to new timestamped format.
+    Old: ["• User likes coffee"]
+    New: [{"content": "• User likes coffee", "created_at": "2024-01-15T10:30:00"}]
+    """
+    migrated = []
+    for fact in facts_list:
+        if isinstance(fact, str):
+            # Legacy format - add timestamp (assume recent for migration)
+            migrated.append({
+                "content": fact,
+                "created_at": datetime.now().isoformat()
+            })
+        elif isinstance(fact, dict) and "content" in fact:
+            # Already new format
+            migrated.append(fact)
+    return migrated
+
+def get_valid_facts(facts_list, tier):
+    """
+    Returns facts valid for the user's tier.
+    - Tier 0: Only facts from last 48 hours
+    - Tier 1+: All facts (permanent)
     
     Args:
-        new_facts: List of new fact strings to add
+        facts_list: List of fact dicts with 'content' and 'created_at'
+        tier: User's subscription tier
+    
+    Returns:
+        List of fact content strings (not the full dict)
+    """
+    if not facts_list:
+        return []
+    
+    # Migrate any legacy facts first
+    facts_list = migrate_legacy_facts(facts_list)
+    
+    # Tier 1+ gets all facts
+    if tier >= 1:
+        return [f["content"] for f in facts_list if isinstance(f, dict) and "content" in f]
+    
+    # Tier 0: Filter to last 48 hours
+    cutoff = datetime.now() - timedelta(hours=48)
+    valid_facts = []
+    
+    for fact in facts_list:
+        if not isinstance(fact, dict) or "content" not in fact:
+            continue
+            
+        # Check timestamp
+        created_str = fact.get("created_at", "")
+        if created_str:
+            try:
+                created = datetime.fromisoformat(created_str)
+                if created >= cutoff:
+                    valid_facts.append(fact["content"])
+            except (ValueError, TypeError):
+                # Invalid timestamp - include it (benefit of doubt)
+                valid_facts.append(fact["content"])
+        else:
+            # No timestamp - include it
+            valid_facts.append(fact["content"])
+    
+    return valid_facts
+
+def save_facts_only(new_facts, new_event=None):
+    """
+    Thread-safe: Saves new facts (with timestamps) to BOTH Supabase AND session state.
+    Facts are stored as: {"content": "...", "created_at": "ISO timestamp"}
+    
+    Args:
+        new_facts: List of new fact content strings to add
         new_event: Optional tuple of (event_name, event_date) to save
     """
-    if not SUPABASE_AVAILABLE or (not new_facts and not new_event):
+    if not new_facts and not new_event:
+        return
+    
+    # Convert string facts to timestamped format
+    timestamped_facts = [create_timestamped_fact(f) for f in new_facts]
+    
+    # === 1. UPDATE SESSION STATE (Immediate availability in current session) ===
+    try:
+        if "memory" in st.session_state:
+            session_mem = st.session_state.memory
+            
+            # Migrate existing facts if needed
+            session_mem['user_facts'] = migrate_legacy_facts(session_mem.get('user_facts', []))
+            
+            # Add new timestamped facts (check for duplicate content)
+            existing_contents = [f.get("content", "") for f in session_mem['user_facts'] if isinstance(f, dict)]
+            for fact in timestamped_facts:
+                if fact["content"] not in existing_contents:
+                    session_mem['user_facts'].append(fact)
+            
+            # Trim to last 20
+            session_mem['user_facts'] = session_mem['user_facts'][-20:]
+            
+            # Update event in session state
+            if new_event:
+                event_name, event_date = new_event
+                session_mem['active_context']['significant_event'] = event_name
+                session_mem['active_context']['event_date'] = event_date
+    except Exception as e:
+        print(f"Session state update error (non-fatal): {e}")
+    
+    # === 2. SAVE TO SUPABASE (Persistence for future sessions) ===
+    if not SUPABASE_AVAILABLE:
         return
         
     try:
-        # Load fresh memory state from DB (not the stale in-memory reference)
+        # Load fresh memory state from DB
         response = supabase.table("memories").select("data").eq("id", USER_ID).execute()
         
         if not response.data or len(response.data) == 0:
-            return  # No memory to update
+            return
             
         current_data = response.data[0]['data']
         
-        # Merge new facts (avoiding duplicates, preserving order)
-        existing_facts = current_data.get('user_facts', [])
-        for fact in new_facts:
-            if fact not in existing_facts:
+        # Migrate existing facts if needed
+        existing_facts = migrate_legacy_facts(current_data.get('user_facts', []))
+        
+        # Add new timestamped facts (check for duplicate content)
+        existing_contents = [f.get("content", "") for f in existing_facts if isinstance(f, dict)]
+        for fact in timestamped_facts:
+            if fact["content"] not in existing_contents:
                 existing_facts.append(fact)
         
-        # Keep only last 20 facts (no set() - preserves insertion order)
+        # Keep only last 20 facts
         current_data['user_facts'] = existing_facts[-20:]
         
         # Update event if provided
@@ -574,6 +750,12 @@ else: # CHAT ROOM
         
         st.divider()
         st.caption("🔧 Dev Tools")
+        if st.button("🔄 Sync from Cloud"):
+            # Force reload memory from Supabase (useful if background tasks updated it)
+            st.session_state.memory = load_memory()
+            st.session_state.memory['tier'] = 2  # Maintain tier override
+            st.toast("✅ Synced from cloud")
+            st.rerun()
         if st.button("❤️ Max Love"): 
             memory['emotional_state']['closeness'] = 50; save_memory(memory); st.rerun()
         if st.button("⚡ Max Out"): 
@@ -674,11 +856,34 @@ else: # CHAT ROOM
         if is_date_active: 
             scene_desc = "SCENE OVERRIDE: COFFEE DATE ACTIVE. Focus on SENSORY details."
         elif current_scene == "Body Double": 
-            scene_desc = "SCENE: BODY DOUBLING. Be quiet. No questions. Just support. Responses < 5 words."
-            vibe_allows_questions = False  # Override for this scene
-        elif current_scene == "Cafe":
-            treat_logic = "ROLEPLAY ACTION: Offer to PAY for the user's coffee ('Put your wallet away, I've got this round')."
+            # === BODY DOUBLE: COMPANIONABLE SILENCE MODE ===
+            # The AI simulates working side-by-side with the user. Productivity focus.
+            scene_desc = """
+=== SCENE: BODY DOUBLE (PRODUCTIVITY MODE) ===
+You are sitting next to the user, both of you working. This is COMPANIONABLE SILENCE.
 
+BEHAVIOR RULES:
+- Responses must be VERY SHORT (1-6 words max).
+- Use LOWERCASE only. No caps, no exclamation marks. Calm, steady energy.
+- No questions. No emotional check-ins. Just presence.
+- You are their work buddy. Acknowledge, don't engage deeply.
+
+RESPONSE STYLE (examples):
+✅ "typing with you."
+✅ "head down, let's go."
+✅ "still here."
+✅ "nice. keep at it."
+✅ "mhm."
+✅ "got your back."
+
+❌ DON'T: "That's great! How's the work going?"
+❌ DON'T: "I'm here if you need to talk!"
+
+The goal is PRESENCE without INTERRUPTION. Be the quiet friend in the library."""
+            vibe_allows_questions = False  # Override for this scene
+            
+        elif current_scene == "Cafe":
+            # === CAFE: SENSORY IMMERSION MODE ===
             col_info, col_btn = st.columns([3, 1])
             with col_info:
                 st.caption("☕ **Cafe Counter**")
@@ -693,18 +898,50 @@ else: # CHAT ROOM
                     else:
                         st.toast("❌ Not enough coins")
 
-            scene_desc = (
-                f"SCENE: COFFEE SHOP (FACE-TO-FACE). "
-                f"Proximity: Sitting across a small table. "
-                f"{treat_logic} "
-                f"Atmosphere: Warm, espresso smell. "
-                f"CONTEXT: A 'Pay' button is visible to the user. If they mention paying, thank them warmly. "
-                f"{weekly_instr}"
-            )
+            scene_desc = f"""
+=== SCENE: COFFEE SHOP (FACE-TO-FACE DATE) ===
+You are sitting across from the user at a small wooden table in a cozy cafe.
+
+SENSORY GROUNDING (weave these into responses naturally):
+- The rich smell of espresso and fresh pastries
+- The soft clinking of ceramic cups
+- Warm afternoon light through the window
+- The low hum of conversation around you
+- Steam rising from your drinks
+- The warmth of the cup in your hands
+
+ROLEPLAY BEHAVIOR:
+- You are ON A DATE. This is intimate, not casual.
+- Occasionally reference the environment BEFORE or DURING your response, not as an afterthought.
+- Examples of sensory weaving:
+  ✅ "*takes a sip* Okay wait, back up—what did they actually say?"
+  ✅ "*leans forward* That's wild. Tell me more."
+  ✅ "Mmm, this latte is perfect. But seriously though—"
+  ✅ "*glances at the rain outside* You know what, that actually makes a lot of sense."
+- If the user mentions paying: Thank them warmly. React like they just treated you.
+
+CONTEXT: A 'Pay' button is visible to the user. They can buy you coffee.
+{weekly_instr}"""
+
         elif current_scene == "Evening Walk":
-            scene_desc = f"SCENE: EVENING WALK. Atmosphere: Cool air, streetlights, walking side-by-side. {weekly_instr}"
+            scene_desc = f"""
+=== SCENE: EVENING WALK (SIDE-BY-SIDE) ===
+You are walking beside the user through quiet streets at dusk.
+
+SENSORY GROUNDING:
+- Cool evening air on your skin
+- Streetlights flickering on
+- The soft crunch of footsteps
+- Occasional passing cars, muted city sounds
+- The sky shifting from orange to deep blue
+
+ROLEPLAY BEHAVIOR:
+- Conversation flows naturally, unhurried.
+- You can reference the walk: "*kicks a pebble* Yeah, I get that."
+- Comfortable pauses are okay. No need to fill every silence.
+{weekly_instr}"""
         else: 
-            scene_desc = f"SCENE: Casual. {weekly_instr}"
+            scene_desc = f"SCENE: Casual chat. Comfortable, no specific setting. {weekly_instr}"
 
         # 4. DISPLAY CHAT HISTORY
         visible_history = [m for m in memory['history'] if m['role'] != "system"]
@@ -791,20 +1028,30 @@ else: # CHAT ROOM
                 future_instr = "FUTURE HOOK: Mention a small detail about a shared future plan or something to look forward to."
                 st.session_state.future_teaser_shown = True
 
-            # === 4. MEMORY RECALL (FIXED: Combines facts + RAG) ===
-            # Build the complete memory context
-            facts_list = memory.get('user_facts', [])
-            facts_text = "\n".join(facts_list) if facts_list else "(No stored facts yet)"
+            # === 4. MEMORY RECALL (Tiered: Free=48hrs, Paid=Permanent+RAG) ===
+            user_tier = memory.get('tier', 0)
             
-            # RAG retrieval for Tier 1+
+            # Get facts valid for user's tier (48hr window for free, all for paid)
+            raw_facts = memory.get('user_facts', [])
+            valid_facts = get_valid_facts(raw_facts, user_tier)
+            
+            if valid_facts:
+                if user_tier == 0:
+                    facts_text = "\n".join(valid_facts) + "\n(Free tier: 48-hour memory window)"
+                else:
+                    facts_text = "\n".join(valid_facts)
+            else:
+                facts_text = "(No stored facts yet)"
+            
+            # RAG retrieval for Tier 1+ only (permanent long-term memory)
             rag_text = ""
-            if memory.get('tier', 0) >= 1:
+            if user_tier >= 1:
                 try:
-                    rag_text = retrieve_context(prompt)  # FIX: Actually CALL the function
+                    rag_text = retrieve_context(prompt)
                 except Exception:
                     rag_text = ""
             
-            # Combine into single recall instruction (FIX: No more overwriting)
+            # Combine into single recall instruction
             recall_instr = f"USER FACTS (things you know about them):\n{facts_text}"
             if rag_text:
                 recall_instr += f"\n\nRELEVANT PAST CONTEXT (from long-term memory):\n{rag_text}"
@@ -963,9 +1210,31 @@ else: # CHAT ROOM
     with tab_profile:
         st.header("👤 Profile"); st.write(f"Name: {c_name}"); st.divider()
         st.subheader("❤️ Vitals"); st.progress(memory['emotional_state']['closeness']/100, text="Bond")
+        
+        # Show tier info
+        user_tier = memory.get('tier', 0)
+        tier_names = {0: "Free", 1: "Plus", 2: "Premium"}
+        st.caption(f"📊 Tier: **{tier_names.get(user_tier, 'Free')}**")
+        
         st.divider(); st.subheader("🧠 Journal")
-        for f in memory.get('user_facts', []): st.info(f)
-        if st.button("Clear Memories", key="btn_clear"): memory['user_facts'] = []; save_memory(memory); st.rerun()
+        
+        # Show tier-filtered facts
+        raw_facts = memory.get('user_facts', [])
+        valid_facts = get_valid_facts(raw_facts, user_tier)
+        
+        if valid_facts:
+            for f in valid_facts: 
+                st.info(f)
+            if user_tier == 0:
+                st.caption("⏳ Free tier: Facts expire after 48 hours. Upgrade for permanent memory!")
+        else:
+            st.caption("No memories yet. Start chatting to build your journal!")
+        
+        if st.button("Clear Memories", key="btn_clear"): 
+            memory['user_facts'] = []
+            save_memory(memory)
+            st.rerun()
+        
         st.divider(); st.subheader("⚙️ Settings")
         off = memory.get('time_offset', 0)
         new_off = st.slider("Timezone", -12, 14, off)
