@@ -638,7 +638,7 @@ else: # CHAT ROOM
         
         memory['history'].append({"role": "user", "content": prompt})
         
-        # 2. FAST LOGIC (Local State)
+        # 2. FAST STATE UPDATES (CPU only, no API calls)
         memory['emotional_state'] = update_emotional_state(prompt, memory['emotional_state'])
         memory['last_active_timestamp'] = str(datetime.now())
         msg_count = len(memory['history'])
@@ -740,7 +740,7 @@ else: # CHAT ROOM
         with st.chat_message("assistant", avatar=avatar_file):
             bubble = st.empty()
             bubble.markdown("... *typing*")
-            time.sleep(random.uniform(1.0, 2.0))
+            time.sleep(random.uniform(0.5, 1.0))
             bubble.empty()
             
             # 1. Get the stream (Logic)
@@ -754,28 +754,31 @@ else: # CHAT ROOM
             # 2. Render the stream (Display)
             # This handles the streaming text effect automatically
             response = st.write_stream(stream)
-
-        # === 7. BACKGROUND TASKS (Post-Display) ===
-        
-        # Save to local history
         memory['history'].append({"role": "assistant", "content": response})
 
-        # Fact Extraction (Slow) - Done AFTER display
+        # === 7. BACKGROUND TASKS (Post-Display) ===
+        # A. Fact Extraction
         extract_and_save_facts(memory['history'])
-
-        # Save to Vector DB (Tier 1+)
+        
+        # B. Vector Memory Save (Tier 1+)
         if len(prompt) > 20 and memory.get('tier', 0) >= 1:
             save_vector_memory(prompt)
 
-        # Agency Reward
+        # C. Truncation (The "Fat Payload" Fix)
+        # Keep only last 50 messages in Hot RAM to keep Supabase writes fast
+        if len(memory['history']) > 50:
+            memory['history'] = memory['history'][-50:]
+
+        # D. Save & Rerun
+        save_memory(memory)
+        
+        # Reverse Agency Gift Logic
         if memory['emotional_state']['agency'] > 20 and random.random() < 0.1:
             memory['balance'] += 15
             st.toast(f"🎁 {c_name} sent you 15 coins!", icon="💖")
             
         memory['balance'] += 2
-        save_memory(memory)
         st.rerun()
-
     with tab_shop:
         st.header("🎁 Gift Shop")
         st.write(f"Balance: **{memory['balance']}c**")
