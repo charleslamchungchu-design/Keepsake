@@ -1,4 +1,4 @@
-streamlit
-openai
-supabase
-anthropic
+streamlit>=1.28.0
+openai>=1.0.0
+supabase>=2.0.0
+# anthropic>=0.18.0  # Optional - uncomment if adding Claude support

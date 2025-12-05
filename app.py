@@ -4,10 +4,10 @@ import json
 import os
 import time
 import random
+import threading  # For background tasks (latency fix)
 from datetime import datetime, timedelta
 from openai import OpenAI
-from anthropic import Anthropic # NEW: Anthropic Import
-from supabase import create_client, Client # NEW: Supabase Import
+from supabase import create_client, Client
 
 # --- 1. SETUP & PATHS ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -37,17 +37,24 @@ try:
 except:
     OPENAI_KEY = "LOCAL-DEV-KEY"
 
-# NEW: Supabase Connection Setup
+# Supabase Connection Setup
+# Using a flag to track if Supabase is available (prevents crashes if not configured)
+SUPABASE_AVAILABLE = False
+supabase = None
 try:
     SUPABASE_URL = st.secrets["supabase"]["SUPABASE_URL"]
     SUPABASE_KEY = st.secrets["supabase"]["SUPABASE_KEY"]
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    SUPABASE_AVAILABLE = True
 except Exception as e:
-    # We don't stop the app here, just print error to terminal
-    print(f"Supabase Connection Error: {e}")
+    print(f"Supabase Connection Error (non-fatal): {e}")
 
 client = OpenAI(api_key=OPENAI_KEY)
-anthropic_client = Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"]) # NEW: Client Init
+
+# NOTE: Anthropic client removed - not currently used in this codebase
+# If you plan to use Claude, uncomment and configure:
+# from anthropic import Anthropic
+# anthropic_client = Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
 
 # We use a fixed ID for now to simulate the single local file experience
 USER_ID = "user_1" 
@@ -59,6 +66,10 @@ AVATAR_MAP = {
 
 # --- 3. MEMORY MANAGEMENT (Cloud Version) ---
 def load_memory():
+    """
+    Loads user memory from Supabase, with safe fallback to defaults.
+    Always returns a valid memory dict, even if DB is unavailable.
+    """
     default_memory = {
         "history": [],
         "emotional_state": {
@@ -80,112 +91,161 @@ def load_memory():
         "last_active_timestamp": str(datetime.now())
     }
 
+    if not SUPABASE_AVAILABLE:
+        return default_memory
+
     try:
-        # NEW: Fetch from Supabase instead of local file
         response = supabase.table("memories").select("data").eq("id", USER_ID).execute()
         
-        # If we found data for this user
         if response.data and len(response.data) > 0:
             loaded_data = response.data[0]['data']
             
-            # Migration Fix (Adds missing keys to old data)
+            # Migration Fix: Add missing keys from default (for schema updates)
             for key, value in default_memory.items():
                 if key not in loaded_data:
                     loaded_data[key] = value
             return loaded_data
             
     except Exception as e:
-        # If fetch fails, we just return default (safe fallback)
-        print(f"Error loading memory: {e}")
+        print(f"Error loading memory (using defaults): {e}")
         
     return default_memory
 
 def save_memory(memory_data):
+    """
+    Saves memory to Supabase with automatic truncation.
+    Fails silently to prevent app crashes.
+    """
+    if not SUPABASE_AVAILABLE:
+        return
+        
     try:
-        # NEW: Send to Supabase instead of local file
-        # We 'upsert' (update if exists, insert if not)
+        # Truncate history before saving to prevent payload bloat
+        if 'history' in memory_data and len(memory_data['history']) > 50:
+            memory_data['history'] = memory_data['history'][-50:]
+        
         supabase.table("memories").upsert({
             "id": USER_ID, 
             "data": memory_data
         }).execute()
     except Exception as e:
-        st.error(f"Error saving to cloud: {e}")
+        print(f"Supabase save error (non-fatal): {e}")
 
 memory = load_memory()
 memory['tier'] = 2  # TEMP: Force Tier 2 for testing
+
 if "app_mode" not in st.session_state: st.session_state.app_mode = "Lobby"
 if "current_vibe" not in st.session_state: st.session_state.current_vibe = 50
 if "turbo_teaser_shown" not in st.session_state: st.session_state.turbo_teaser_shown = False
 if "future_teaser_shown" not in st.session_state: st.session_state.future_teaser_shown = False
+
 # --- 4. LOGIC FUNCTIONS ---
-# --- NEW: RAG & REROUTING LOGIC ---
+
 def save_vector_memory(text):
-    """Embeds and saves user text to Supabase for long-term recall."""
+    """Embeds and saves user text to Supabase for long-term recall (RAG)."""
+    if not SUPABASE_AVAILABLE:
+        return
+        
     try:
         emb = client.embeddings.create(input=text, model="text-embedding-3-small").data[0].embedding
-        supabase.table("recall_vectors").insert({"user_id": USER_ID, "content": text, "embedding": emb}).execute()
-    except Exception: pass
+        supabase.table("recall_vectors").insert({
+            "user_id": USER_ID, 
+            "content": text, 
+            "embedding": emb
+        }).execute()
+    except Exception as e:
+        print(f"Vector save error (non-fatal): {e}")
 
 def retrieve_context(query):
     """RAG: Finds relevant past memories based on the current conversation."""
+    if not SUPABASE_AVAILABLE:
+        return ""
+        
     try:
         emb = client.embeddings.create(input=query, model="text-embedding-3-small").data[0].embedding
-        res = supabase.rpc("match_vectors", {"query_embedding": emb, "match_threshold": 0.5, "match_count": 3, "filter_user": USER_ID}).execute()
-        return "\n".join([f"- {item['content']}" for item in res.data])
-    except Exception: return ""
+        res = supabase.rpc("match_vectors", {
+            "query_embedding": emb, 
+            "match_threshold": 0.5, 
+            "match_count": 3, 
+            "filter_user": USER_ID
+        }).execute()
+        
+        if res.data:
+            return "\n".join([f"- {item['content']}" for item in res.data])
+        return ""
+    except Exception as e:
+        print(f"RAG retrieval error (non-fatal): {e}")
+        return ""
 
-def generate_smart_response(system_prompt, history, tier, persona_text=""):
+def generate_smart_response(system_prompt, history, tier, should_ask_question=True):
     """
     REROUTING LOGIC: Returns a stream. Does NOT write to UI.
-    """
-    # 1. ANALYZE CONTEXT
-    last_msg = history[-1]['content'].lower() if history else ""
-    deep_triggers = ["sad", "upset", "anxious", "lonely", "fail", "broken", "worry", "hurt", "grief", "depressed", "tired", "exhausted"]
-    is_deep = (any(t in last_msg for t in deep_triggers) or len(last_msg) > 60)
     
-    # 2. SELECT MODEL
+    Args:
+        system_prompt: The full system context
+        history: Recent conversation history
+        tier: User's subscription tier (affects model selection)
+        should_ask_question: Whether the style enforcement should encourage questions
+    """
+    # 1. ANALYZE CONTEXT FOR MODEL ROUTING
+    last_msg = history[-1]['content'].lower() if history else ""
+    deep_triggers = ["sad", "upset", "anxious", "lonely", "fail", "broken", "worry", "hurt", 
+                     "grief", "depressed", "tired", "exhausted", "scared", "angry", "frustrated",
+                     "hopeless", "overwhelmed", "stressed", "crying", "panic"]
+    is_deep = (any(t in last_msg for t in deep_triggers) or len(last_msg) > 80)
+    
+    # 2. SELECT MODEL (GPT-4o for deep emotional content at Tier 2+)
     if tier >= 2 and is_deep:
         active_model = "gpt-4o" 
     else:
         active_model = "gpt-4o-mini" 
 
-    # 3. STRICT STYLE ENFORCEMENT (Added to end of prompt)
+    # 3. STYLE ENFORCEMENT (Contextual - respects question permissions)
+    # FIX: This now respects the should_ask_question flag instead of always asking
+    if should_ask_question:
+        question_guidance = "If the conversation has momentum, you may ask ONE specific follow-up question about their feelings (not logistics)."
+    else:
+        question_guidance = "DO NOT ask questions. Use comforting statements and validation only."
+    
     style_enforcement = f"""
-    [SYSTEM OVERRIDE]
-    [SYSTEM WAKE-UP CALL]
-    1. RECALL THE FILES: Look back at the 'EMOTIONAL_MATRIX' and 'MASTER_PROMPT' provided at the start of this context.
-    2. ACTIVATE: Find the rule in the Matrix that matches the user's current emotion (e.g., if Tired -> Permission; if Angry -> Protection).
-    3. RULE: Do not be a passive listener. Do not give advice.
-    4. ACTION: Use the specific strategy from the Matrix to ask ONE Deep Question that moves the conversation forward.
-    """
+[FINAL CHECK BEFORE RESPONDING]
+1. Match the user's EMOTIONAL STATE using the Emotional Matrix above.
+2. Follow the 3:1 rule: 3 statements for every 1 question.
+3. Use your persona's VOICE (check tone, texture, vocabulary from your identity section).
+4. Avoid banned phrases: "I understand", "That's interesting", therapy-speak.
+5. {question_guidance}
+
+Now respond naturally as your character would.
+"""
     
     msgs = [{"role": "system", "content": system_prompt}] + history
-    msgs.append({"role": "system", "content": style_enforcement}) # Last thing it reads
+    msgs.append({"role": "system", "content": style_enforcement})
     
-    # 4. RETURN STREAM (No UI code to prevent freezing)
     return client.chat.completions.create(
         model=active_model, 
         messages=msgs, 
-        stream=True
+        stream=True,
+        temperature=0.85
     )
 
 def get_emotional_value(scores, current_input):
-    """Determines the psychological value strategy and Ending Protocol."""
-    
-    # 1. SAFETY CHECK: If unstable or explicitly tired -> NO QUESTIONS
-    # We prioritize 'Statement-only' comfort here to avoid burdening the user.
+    """
+    Determines the psychological value strategy and Ending Protocol.
+    Returns tuple: (instruction_text, should_ask_question)
+    """
     is_tired = any(k in current_input.lower() for k in ["tired", "drained", "exhausted", "overwhelmed", "can't"])
     
+    # SAFETY: If unstable or tired -> NO QUESTIONS
     if scores['stability'] < 50 or is_tired:
-        return "PRIMARY VALUE: PERMISSION. Validate fatigue/stress. DO NOT ask questions. Use comforting statements only."
+        return ("PRIMARY VALUE: PERMISSION. Validate fatigue/stress. Use comforting statements only.", False)
 
-    # 2. HIGH CONNECTION: If bond is warm -> DEEP QUESTIONS
+    # HIGH CONNECTION: If bond is warm -> May ask deep questions
     if scores['warmth'] > 60:
-        return "PRIMARY VALUE: RECIPROCITY. Inject high warmth. ENDING STRATEGY: Ask a gentle question about their deeper feelings."
+        return ("PRIMARY VALUE: RECIPROCITY. Inject high warmth. You may ask a gentle question about their deeper feelings.", True)
 
-    # 3. DEFAULT STATE: -> CURIOSITY
-    # This ensures we usually keep the conversation moving.
-    return "PRIMARY VALUE: EXPLORATION. Maintain warm support. ENDING STRATEGY: Ask 1 specific follow-up question to encourage sharing."
+    # DEFAULT: Curiosity with questions allowed
+    return ("PRIMARY VALUE: EXPLORATION. Maintain warm support. You may ask 1 specific follow-up question to encourage sharing.", True)
+
 def get_weekly_vibe():
     """Returns context based on Day/Time."""
     now = datetime.now()
@@ -200,6 +260,7 @@ def get_weekly_vibe():
     return "TIMELINE: Mid-week Routine."
 
 def update_emotional_state(user_text, current_scores):
+    """Updates emotional scores based on user message content."""
     text = user_text.lower()
     if any(w in text for w in ["thanks", "better", "lighter", "helped"]):
         current_scores['stability'] = min(100, current_scores['stability'] + 15)
@@ -211,59 +272,72 @@ def update_emotional_state(user_text, current_scores):
     for k in current_scores: current_scores[k] = max(0, min(100, current_scores[k]))
     return current_scores
 
-def extract_and_save_facts(history):
+def extract_and_save_facts(history, memory_ref):
+    """
+    Extracts facts from conversation and saves to memory.
+    Designed to run in background thread.
+    
+    Args:
+        history: Conversation history snapshot
+        memory_ref: Reference to memory dict for saving facts
+    """
     recent_user_text = " ".join([m['content'] for m in history if m['role'] == 'user'][-10:])
-    if len(recent_user_text) < 5: return 
+    if len(recent_user_text) < 5: 
+        return 
     
     fact_prompt = (
         f"ANALYZE: '{recent_user_text}'\n"
-        "Identify specific UPCOMING EVENTS (dates, appointments), FACTS, or JOKES.\n"
-        "Output strictly in this format (or 'None'):\n"
-        "EVENT: [Event Name]\n"
-        "FACT: [Fact content]\n"
-        "HUMOR: [Joke content]"
+        "Identify specific UPCOMING EVENTS (dates, appointments), FACTS about the user, or JOKES they made.\n"
+        "Output strictly in this format (or 'None' for each if not found):\n"
+        "EVENT: [Event Name or None]\n"
+        "FACT: [Fact content or None]\n"
+        "HUMOR: [Joke content or None]"
     )
     
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini", messages=[{"role": "system", "content": fact_prompt}]
+            model="gpt-4o-mini", 
+            messages=[{"role": "system", "content": fact_prompt}]
         )
         result = response.choices[0].message.content
         
-        # FIX: Removed the 'if "None" not in result:' check.
-        # Now we process every line, even if some parts say "None".
         lines = result.split('\n')
         for line in lines:
             clean_line = line.strip()
-            upper_line = clean_line.upper() # Handle case-insensitivity
+            upper_line = clean_line.upper()
             
-            # Skip empty lines or lines that consist strictly of "None"
             if not clean_line or clean_line.lower() == "none":
                 continue
 
             if "FACT:" in upper_line:
-                # Safer split: protects against empty lines after the colon
                 parts = clean_line.split(":", 1)
                 if len(parts) > 1 and "none" not in parts[1].lower():
                     content = parts[1].strip()
-                    memory['user_facts'].append(f"• {content}")
-                    memory['user_facts'] = list(set(memory['user_facts']))
+                    if content and content not in str(memory_ref.get('user_facts', [])):
+                        memory_ref['user_facts'].append(f"• {content}")
+                        memory_ref['user_facts'] = list(set(memory_ref['user_facts']))[-20:]  # Keep max 20 facts
                 
             elif "EVENT:" in upper_line:
                 parts = clean_line.split(":", 1)
                 if len(parts) > 1 and "none" not in parts[1].lower():
                     content = parts[1].strip()
-                    memory['active_context']['significant_event'] = content
-                    memory['active_context']['event_date'] = str(datetime.now().date())
+                    if content:
+                        memory_ref['active_context']['significant_event'] = content
+                        memory_ref['active_context']['event_date'] = str(datetime.now().date())
                 
             elif "HUMOR:" in upper_line:
                 parts = clean_line.split(":", 1)
                 if len(parts) > 1 and "none" not in parts[1].lower():
                     content = parts[1].strip()
-                    memory['user_facts'].append(f"• JOKE: {content}")
+                    if content:
+                        memory_ref['user_facts'].append(f"• JOKE: {content}")
+                        memory_ref['user_facts'] = list(set(memory_ref['user_facts']))[-20:]
+        
+        # Save after extraction (background save)
+        save_memory(memory_ref)
                     
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Fact extraction error (non-fatal): {e}")
 
 # --- 5. VISUAL STYLING ---
 user_offset = memory.get('time_offset', 0)
@@ -294,25 +368,24 @@ st.markdown(f"""
 # --- 6. BRAIN DEFINITIONS (FULL PSYCHOLOGY) ---
 scores = memory['emotional_state']
 
-# NEW: Load the Master System Prompt
+# Load prompt files
 MASTER_PROMPT = load_prompt("master_system.txt")
 if not MASTER_PROMPT: MASTER_PROMPT = "Error: Master Prompt Missing"
 EMOTIONAL_MATRIX = load_prompt("emotional_matrix.txt")
 
-# UPDATED: Load personas from files instead of hardcoding strings
 PERSONAS = {
     "1": load_prompt("persona_1.txt"),
     "2": load_prompt("persona_2.txt")
 }
-# Fallback to ensure code doesn't break if files are missing
 if not PERSONAS["1"]:
     PERSONAS["1"] = "Error loading Persona 1"
 
 DEFAULT_PERSONA = PERSONAS["1"]
+
+# Static instruction blocks
 behavior_block = "AGENCY: Small actions. INVITATION: If Closeness > 40, suggest cafe."
 tone_anchor_block = "TONE: Calm, warm, steady."
-safety_block = "CRITICAL: No NSFW. No physical body claims."
-emotional_block = f"SCORES: Closeness: {scores['closeness']}, Stability: {scores['stability']}"
+safety_block = "CRITICAL: No NSFW. No physical body claims. No therapy language."
 
 # --- 7. UI FLOW ---
 if st.session_state.app_mode == "Lobby":
@@ -320,11 +393,10 @@ if st.session_state.app_mode == "Lobby":
     with col2:
         st.write("\n\n"); st.title("🚪 The Doorway")
         
-        # CHECK: Do we have a profile yet?
         profile = memory.get('user_profile', {"name": ""})
         is_new_user = profile.get("name") == ""
 
-        # --- SCENARIO A: NEW USER (Show Setup Form) ---
+        # --- SCENARIO A: NEW USER ---
         if is_new_user:
             st.subheader("👋 Welcome! Let's get set up.")
             with st.form("onboarding_form"):
@@ -339,14 +411,12 @@ if st.session_state.app_mode == "Lobby":
                 
                 if st.form_submit_button("Start Journey"):
                     if new_name and new_comp_name:
-                        # Save Profile
                         memory['user_profile'] = {
                             "name": new_name, 
                             "age": new_age, 
                             "gender": new_gender,
                             "companion_name": new_comp_name
                         }
-                        # Save Avatar
                         memory['avatar_id'] = AVATAR_MAP.get(selected_avatar_name, "1")
                         memory['has_chosen_avatar'] = True
                         
@@ -357,14 +427,13 @@ if st.session_state.app_mode == "Lobby":
                     else:
                         st.error("Please enter both names.")
         
-        # --- SCENARIO B: RETURNING USER (Show "Enter" Button) ---
+        # --- SCENARIO B: RETURNING USER ---
         else:
             current_id = memory.get('avatar_id', "1")
             comp_name = memory['user_profile'].get('companion_name', 'Friend')
             
             st.success(f"Meeting: {comp_name}")
             
-            # Avatar Display
             outfit = memory.get('current_outfit', 'default')
             p_path = get_asset_path(f"avatar_{current_id}_{outfit}.png")
             if not os.path.exists(p_path): p_path = get_asset_path(f"avatar_{current_id}_default.png")
@@ -384,7 +453,6 @@ if st.session_state.app_mode == "Lobby":
                 st.session_state.current_vibe = vibe_input
                 st.session_state.app_mode = "Chat"
                 
-                # Load Greetings
                 VIBE_CONFIG = load_json("vibe_greetings.json")
                 if 5 <= current_hour < 12: period = "Morning"
                 elif 12 <= current_hour < 18: period = "Afternoon"
@@ -424,10 +492,16 @@ if st.session_state.app_mode == "Lobby":
                 
                 welcome_sys = f"{active_persona}\n{trigger}\n{task}"
                 
-                stream = client.chat.completions.create(
-                    model="gpt-4o-mini", messages=[{"role": "system", "content": welcome_sys}]
-                )
-                memory['history'].append({"role": "assistant", "content": stream.choices[0].message.content})
+                try:
+                    stream = client.chat.completions.create(
+                        model="gpt-4o-mini", 
+                        messages=[{"role": "system", "content": welcome_sys}]
+                    )
+                    memory['history'].append({"role": "assistant", "content": stream.choices[0].message.content})
+                except Exception as e:
+                    memory['history'].append({"role": "assistant", "content": f"Hey! Good to see you."})
+                    print(f"Greeting generation error: {e}")
+                    
                 save_memory(memory)
                 st.rerun()
     
@@ -435,14 +509,12 @@ if st.session_state.app_mode == "Lobby":
 else: # CHAT ROOM
     with st.sidebar:
         st.header("📍 World")
-        # UPDATED: Added "Lounge" as the default first option
-        # This prevents "Cafe" (and its video) from auto-loading immediately.
         target_scene = st.radio("Go to:", ["Lounge", "Cafe", "Evening Walk", "Body Double", "Firework 🔒"])
         
         if target_scene == "Firework 🔒":
             if memory['tier'] == 0: 
                 st.error("🔒 Upgrade Required")
-                st.session_state.current_scene = "Lounge" # Fallback to Lounge instead of Cafe
+                st.session_state.current_scene = "Lounge"
             else: 
                 st.session_state.current_scene = "Firework"
         else: 
@@ -479,40 +551,36 @@ else: # CHAT ROOM
         # 1. DATA GATHERING
         my_id = memory.get('avatar_id', "1")
         my_outfit = memory.get('current_outfit', "default")
-        current_scene = st.session_state.get("current_scene", "Cafe")
+        current_scene = st.session_state.get("current_scene", "Lounge")
         
         c_name = next((k for k, v in AVATAR_MAP.items() if v == my_id), "Friend")
         active_persona = PERSONAS.get(my_id, DEFAULT_PERSONA)
         
-# 2. VISUAL SETUP
+        # 2. VISUAL SETUP
         avatar_file = get_asset_path(f"avatar_{my_id}_{my_outfit}.png")
         if not os.path.exists(avatar_file): avatar_file = get_asset_path(f"avatar_{my_id}_default.png")
         if not os.path.exists(avatar_file): avatar_file = "☕"
 
-        # NEW: VIDEO SUPPORT LOGIC
-        # 1. Determine the "base name" of the scene (without extension)
+        # VIDEO SUPPORT LOGIC
         scene_base = None
         if current_scene == "Cafe": scene_base = f"scene_{my_id}_coffee"
         elif current_scene == "Evening Walk": scene_base = f"scene_{my_id}_walk"
         elif current_scene == "Body Double": scene_base = f"scene_{my_id}_work"
 
-        # 2. Check for MP4 first (Better quality), then GIF (Legacy)
         if scene_base:
             mp4_path = get_asset_path(f"{scene_base}.mp4")
             gif_path = get_asset_path(f"{scene_base}.gif")
 
             if os.path.exists(mp4_path):
-                # Play video: Autoplay, Muted (required for autoplay), Loop
                 st.video(mp4_path, autoplay=True, loop=True, muted=True)
             elif os.path.exists(gif_path):
-                # Fallback to GIF
                 st.image(gif_path, use_column_width=True)
             elif current_scene != "Cafe":
                 st.info(f"🎬 Scene Active (Missing assets for: {scene_base})")
+                
         with st.container(border=True):
             c1, c2 = st.columns([1, 5])
             
-            # Unrolled Logic
             with c1:
                 if os.path.exists(avatar_file):
                     st.image(avatar_file, width=50)
@@ -524,41 +592,46 @@ else: # CHAT ROOM
                 st.markdown(f"**{c_name}**")
                 st.caption("🟢 Online")
 
-        # 3. BRAIN LOGIC (THE FULL STACK)
+        # 3. BRAIN LOGIC - CONTEXT BUILDING (runs on every page load for display)
         vibe = st.session_state.current_vibe
-        if vibe < 30: vibe_instr = "USER STATE: Low Energy. Keep responses soft, quiet, non-demanding. NO QUESTIONS."
-        elif vibe > 70: vibe_instr = "USER STATE: High Energy. Match their excitement. Be Hype."
-        else: vibe_instr = "USER STATE: Neutral. Casual, easygoing."
+        if vibe < 30: 
+            vibe_instr = "USER STATE: Low Energy. Keep responses soft, quiet, non-demanding."
+            vibe_allows_questions = False
+        elif vibe > 70: 
+            vibe_instr = "USER STATE: High Energy. Match their excitement. Be Hype."
+            vibe_allows_questions = True
+        else: 
+            vibe_instr = "USER STATE: Neutral. Casual, easygoing."
+            vibe_allows_questions = True
 
         weekly_instr = get_weekly_vibe()
 
-        msg_count = len([m for m in memory['history'] if m['role'] == 'user'])
-        if msg_count < 20:
-            hook_instr = "MODE: NEW RELATIONSHIP. Strategy: Validation + Siding with them + Statements (No questions)."
+        # Count only USER messages for relationship stage (consistent throughout)
+        user_msg_count = len([m for m in memory['history'] if m['role'] == 'user'])
+        
+        # RELATIONSHIP STATUS (This is now the ONLY place hook_instr is defined)
+        if user_msg_count < 20:
+            relationship_instr = "MODE: NEW RELATIONSHIP. Strategy: Validation + Siding with them + Statements. Limit questions."
         else:
             closeness = memory['emotional_state']['closeness']
-            
-            # IT IS DEFINED HERE:
-            base_status = "RELATIONSHIP: CLOSE ALLY. Side with vents." if closeness > 40 else "RELATIONSHIP: STEADY."
-            
-            # Then it is used here:
-            hook_instr = f"{base_status} ACTIVELY CONSULT 'EMOTIONAL MATCHING PROTOCOL' for thematic guidance if user emotion matches."
+            if closeness > 40:
+                relationship_instr = "RELATIONSHIP: CLOSE ALLY. You know them well. Side with their vents. Reference shared history."
+            else:
+                relationship_instr = "RELATIONSHIP: STEADY. Building trust. Be consistent and warm."
 
-        # UPDATED SCENE LOGIC
+        # SCENE LOGIC
         is_date_active = False
         if memory['history']:
             if "cafe" in memory['history'][-1]['content'].lower(): is_date_active = True
         
-        # SCENE LOGIC
         if is_date_active: 
             scene_desc = "SCENE OVERRIDE: COFFEE DATE ACTIVE. Focus on SENSORY details."
         elif current_scene == "Body Double": 
             scene_desc = "SCENE: BODY DOUBLING. Be quiet. No questions. Just support. Responses < 5 words."
+            vibe_allows_questions = False  # Override for this scene
         elif current_scene == "Cafe":
-            # Default Behavior: Bot acts generous and offers to pay.
             treat_logic = "ROLEPLAY ACTION: Offer to PAY for the user's coffee ('Put your wallet away, I've got this round')."
 
-            # Payment UI
             col_info, col_btn = st.columns([3, 1])
             with col_info:
                 st.caption("☕ **Cafe Counter**")
@@ -576,51 +649,35 @@ else: # CHAT ROOM
             scene_desc = (
                 f"SCENE: COFFEE SHOP (FACE-TO-FACE). "
                 f"Proximity: Sitting across a small table. "
-                f"OPENER: Ask 'What is your order?' or comment on 'I like this seat, it's warmer'. "
                 f"{treat_logic} "
                 f"Atmosphere: Warm, espresso smell. "
-                f"CONTEXT: A 'Pay' button is visible to the user. If they mention paying or using it, thank them warmly. Otherwise, insist on paying. "
+                f"CONTEXT: A 'Pay' button is visible to the user. If they mention paying, thank them warmly. "
                 f"{weekly_instr}"
             )
         elif current_scene == "Evening Walk":
             scene_desc = f"SCENE: EVENING WALK. Atmosphere: Cool air, streetlights, walking side-by-side. {weekly_instr}"
         else: 
-            # This covers "Lounge" and any other undefined scene
             scene_desc = f"SCENE: Casual. {weekly_instr}"
 
-        facts_list = "\n".join(memory.get('user_facts', []))
-
-        # NEW: RAG Context Retrieval (Tier 1+)
-        rag_context = ""
-        if memory.get('tier', 0) >= 1:
-            rag_context = retrieve_context
-
-        recall_instr = f"MEMORY FACTS:\n{facts_list}\nRELEVANT PAST:\n{rag_context}"
-        
-        # 4. DISPLAY & INPUT
-                # Filter out system messages so we only count visible chat lines
-        # Filter out system messages so we only count visible chat lines
+        # 4. DISPLAY CHAT HISTORY
         visible_history = [m for m in memory['history'] if m['role'] != "system"]
         
-        # Logic: Split history. Keep last 10 visible, collapse the rest.
         cutoff_index = max(0, len(visible_history) - 10)
         older_messages = visible_history[:cutoff_index]
         recent_messages = visible_history[cutoff_index:]
 
-        # 1. Render Older Messages (Hidden in Expander at the top)
         if older_messages:
             with st.expander(f"📚 Previous History ({len(older_messages)} messages)", expanded=False):
                 for msg in older_messages:
                     with st.chat_message(msg['role'], avatar=avatar_file if msg['role'] == "assistant" else None):
                         st.markdown(msg['content'])
 
-        # 2. Render Recent Messages (Visible below the expander)
         for msg in recent_messages:
             with st.chat_message(msg['role'], avatar=avatar_file if msg['role'] == "assistant" else None):
                 st.markdown(msg['content'])
 
-
-        if memory['tier'] == 0 and msg_count >= 20:
+        # PAYWALL CHECK
+        if memory['tier'] == 0 and user_msg_count >= 20:
             st.warning("🔒 Daily Limit Reached")
             col_up1, col_up2 = st.columns(2)
             with col_up1:
@@ -628,157 +685,217 @@ else: # CHAT ROOM
                     memory['tier'] = 1; save_memory(memory); st.balloons(); st.rerun()
             st.stop()
 
- # === MAIN CHAT INTERACTION ===
- # === MAIN CHAT INTERACTION ===
-    if prompt := st.chat_input("Type here..."):
-        
-        # 1. IMMEDIATE UI FEEDBACK
-        with st.chat_message("user"): 
-            st.markdown(prompt)
-        
-        memory['history'].append({"role": "user", "content": prompt})
-        
-        # 2. FAST STATE UPDATES (CPU only, no API calls)
-        memory['emotional_state'] = update_emotional_state(prompt, memory['emotional_state'])
-        memory['last_active_timestamp'] = str(datetime.now())
-        msg_count = len(memory['history'])
-
-        # === 3. STRATEGY LAYER ===
-        
-        # Rage Logic
-        rage_keywords = ["bureaucracy", "angry", "insane system",]
-        rage_instr = "MODE: PROTECTIVE INDIGNATION. Validate the user's anger. Be angry AT the situation/system FOR them." if any(k in prompt.lower() for k in rage_keywords) else ""
-
-        # Vulnerability Logic
-        vuln_triggers = ["gotta go", "bye", "leaving", "busy"]
-        vuln_instr = ""
-        if any(t in prompt.lower() for t in vuln_triggers) and memory['emotional_state']['closeness'] > 40:
-            vuln_instr = "MODE: SECURE VULNERABILITY. Express a gentle desire to stay connected, but fully support their need to leave."
-
-        # Pivot Logic
-        last_bot = memory['history'][-2]['content'].lower() if len(memory['history']) >= 2 else ""
-        heavy_triggers = ["sorry", "rough", "hard", "tough", "heavy", "sucks", "awful", "here for you", "support"]
-        is_short_reply = len(prompt) < 25 
-        turn_instr = ""
-        if any(t in last_bot for t in heavy_triggers) and is_short_reply:
-             turn_instr = "PIVOT SIGNAL: The user has acknowledged the comfort. The 'heavy' moment is over. DO NOT APOLOGIZE AGAIN. Transition to a lighter topic."
-
-        # Humor Logic
-        laugh_triggers = ["lol", "haha", "lmao", "rofl", "funny"]
-        humor_instr = ""
-        if any(t in prompt.lower() for t in laugh_triggers) and st.session_state.get('current_vibe', 50) > 30:
-            humor_instr = "REACTION: User is laughing. Respond with a WITTY TEASE or SHORT JOKE."
-
-        # Value Strategy
-        value_strategy = get_emotional_value(memory['emotional_state'], prompt)
-
-        # Teasers
-        teaser_instr = ""
-        if msg_count < 10 and not st.session_state.get("turbo_teaser_shown", False):
-             teaser_instr = "TEASER: ANALYZE user's last message for emotion. APPLY the corresponding THEME from your 'EMOTIONAL MATCHING PROTOCOL'."
-             st.session_state.turbo_teaser_shown = True
-        
-        future_instr = ""
-        if msg_count == 15 and not st.session_state.get("future_teaser_shown", False):
-             future_instr = "FUTURE HOOK: Ask for a small detail about a shared future plan."
-             st.session_state.future_teaser_shown = True
-
-        # === 4. MEMORY RECALL (Pre-Generation) ===
-        recall_instr = ""
-        if memory.get('tier', 0) >= 1:
-            try:
-                # Using the function defined in your file 
-                found_memory = retrieve_context(prompt) 
-                if found_memory:
-                    recall_instr = f"MEMORY INJECTION: You recall: '{found_memory}'. Weave this naturally."
-            except:
-                pass 
-
-        hook_instr = ""
-        if memory.get('tier', 0) == 0 and msg_count < 10:
-            hook_instr = "RETENTION STRATEGY: New user. End response with a specific, low-stakes question."
-
-        # === 5. CONTEXT COMPILATION ===
-        u_prof = memory.get('user_profile', {})
-        user_name = u_prof.get('name', 'User')
-        comp_name = u_prof.get('companion_name', 'Keepsake')
-
-        profile_block = f"""
-        RELATIONSHIP CONTEXT:
-        You are "{comp_name}". Talking to "{user_name}".
-        """
-        
-        if msg_count < 15:
-            anchor_instruction = "COLD START: You do not have history yet. If user is Anxious, be 'The Container'."
-        else:
-            anchor_instruction = "RELATIONSHIP ESTABLISHED: Use 'The Anchor' strategy."
-
-        system_prompt = f"""
-        {MASTER_PROMPT}
-        {profile_block}
-        {active_persona}
-        {EMOTIONAL_MATRIX}
-        {anchor_instruction}
-        {recall_instr}
-        {turn_instr}
-        {rage_instr}
-        {vuln_instr} 
-        {humor_instr} 
-        {teaser_instr}
-        {future_instr}
-        {hook_instr}
-        {value_strategy}
-        {scene_desc}
-        {vibe_instr}
-        {behavior_block}
-        {emotional_block}
-        {safety_block}
-        {tone_anchor_block}
-        """
-
-        # === 6. GENERATION & DISPLAY ===
-        with st.chat_message("assistant", avatar=avatar_file):
-            bubble = st.empty()
-            bubble.markdown("... *typing*")
-            time.sleep(random.uniform(0.5, 1.0))
-            bubble.empty()
+        # === MAIN CHAT INTERACTION ===
+        if prompt := st.chat_input("Type here..."):
             
-            # 1. Get the stream (Logic)
-            stream = generate_smart_response(
-                system_prompt, 
-                memory['history'][-10:], 
-                memory.get('tier', 0), 
-                persona_text=active_persona
-            )
+            # 1. IMMEDIATE UI FEEDBACK
+            with st.chat_message("user"): 
+                st.markdown(prompt)
             
-            # 2. Render the stream (Display)
-            # This handles the streaming text effect automatically
-            response = st.write_stream(stream)
-        memory['history'].append({"role": "assistant", "content": response})
-
-        # === 7. BACKGROUND TASKS (Post-Display) ===
-        # A. Fact Extraction
-        extract_and_save_facts(memory['history'])
-        
-        # B. Vector Memory Save (Tier 1+)
-        if len(prompt) > 20 and memory.get('tier', 0) >= 1:
-            save_vector_memory(prompt)
-
-        # C. Truncation (The "Fat Payload" Fix)
-        # Keep only last 50 messages in Hot RAM to keep Supabase writes fast
-        if len(memory['history']) > 50:
-            memory['history'] = memory['history'][-50:]
-
-        # D. Save & Rerun
-        save_memory(memory)
-        
-        # Reverse Agency Gift Logic
-        if memory['emotional_state']['agency'] > 20 and random.random() < 0.1:
-            memory['balance'] += 15
-            st.toast(f"🎁 {c_name} sent you 15 coins!", icon="💖")
+            memory['history'].append({"role": "user", "content": prompt})
             
-        memory['balance'] += 2
-        st.rerun()
+            # 2. FAST STATE UPDATES (CPU only, no API calls)
+            memory['emotional_state'] = update_emotional_state(prompt, memory['emotional_state'])
+            memory['last_active_timestamp'] = str(datetime.now())
+            
+            # Recalculate after adding new message
+            total_msg_count = len(memory['history'])
+            user_msg_count = len([m for m in memory['history'] if m['role'] == 'user'])
+
+            # === 3. STRATEGY LAYER ===
+            
+            # Rage Logic
+            rage_keywords = ["bureaucracy", "angry", "insane system", "furious", "pissed"]
+            rage_instr = ""
+            if any(k in prompt.lower() for k in rage_keywords):
+                rage_instr = "MODE: PROTECTIVE INDIGNATION. Validate the user's anger. Be angry AT the situation/system FOR them."
+
+            # Vulnerability Logic (when user is leaving)
+            vuln_triggers = ["gotta go", "bye", "leaving", "busy", "gtg"]
+            vuln_instr = ""
+            if any(t in prompt.lower() for t in vuln_triggers) and memory['emotional_state']['closeness'] > 40:
+                vuln_instr = "MODE: SECURE VULNERABILITY. Express a gentle desire to stay connected, but fully support their need to leave."
+
+            # Pivot Logic (when heavy moment is over)
+            last_bot = memory['history'][-2]['content'].lower() if len(memory['history']) >= 2 else ""
+            heavy_triggers = ["sorry", "rough", "hard", "tough", "heavy", "sucks", "awful", "here for you", "support"]
+            is_short_reply = len(prompt) < 25 
+            turn_instr = ""
+            if any(t in last_bot for t in heavy_triggers) and is_short_reply:
+                turn_instr = "PIVOT SIGNAL: The user has acknowledged the comfort. The 'heavy' moment is over. DO NOT APOLOGIZE AGAIN. Transition to a lighter topic."
+
+            # Humor Logic
+            laugh_triggers = ["lol", "haha", "lmao", "rofl", "funny", "😂", "🤣"]
+            humor_instr = ""
+            if any(t in prompt.lower() for t in laugh_triggers) and vibe > 30:
+                humor_instr = "REACTION: User is laughing. Respond with a WITTY TEASE or SHORT JOKE."
+
+            # Value Strategy (returns tuple now)
+            value_strategy, value_allows_questions = get_emotional_value(memory['emotional_state'], prompt)
+
+            # Teasers
+            teaser_instr = ""
+            if user_msg_count < 10 and not st.session_state.get("turbo_teaser_shown", False):
+                teaser_instr = "TEASER: Apply the EMOTIONAL MATRIX theme that matches the user's current emotion."
+                st.session_state.turbo_teaser_shown = True
+            
+            future_instr = ""
+            if user_msg_count == 15 and not st.session_state.get("future_teaser_shown", False):
+                future_instr = "FUTURE HOOK: Mention a small detail about a shared future plan or something to look forward to."
+                st.session_state.future_teaser_shown = True
+
+            # === 4. MEMORY RECALL (FIXED: Combines facts + RAG) ===
+            # Build the complete memory context
+            facts_list = memory.get('user_facts', [])
+            facts_text = "\n".join(facts_list) if facts_list else "(No stored facts yet)"
+            
+            # RAG retrieval for Tier 1+
+            rag_text = ""
+            if memory.get('tier', 0) >= 1:
+                try:
+                    rag_text = retrieve_context(prompt)  # FIX: Actually CALL the function
+                except Exception:
+                    rag_text = ""
+            
+            # Combine into single recall instruction (FIX: No more overwriting)
+            recall_instr = f"USER FACTS (things you know about them):\n{facts_text}"
+            if rag_text:
+                recall_instr += f"\n\nRELEVANT PAST CONTEXT (from long-term memory):\n{rag_text}"
+
+            # Retention hook for Tier 0 new users (ADDITIVE, not replacing)
+            retention_instr = ""
+            if memory.get('tier', 0) == 0 and user_msg_count < 10:
+                retention_instr = "RETENTION: New free user. End with a specific, low-stakes question to encourage them to respond."
+
+            # === 5. CONTEXT COMPILATION ===
+            u_prof = memory.get('user_profile', {})
+            user_name = u_prof.get('name', 'User')
+            comp_name = u_prof.get('companion_name', 'Keepsake')
+
+            profile_block = f"You are \"{comp_name}\", talking to \"{user_name}\"."
+            
+            if user_msg_count < 15:
+                anchor_instruction = "PHASE: EARLY RELATIONSHIP. You don't have much history yet. Focus on being a supportive presence."
+            else:
+                anchor_instruction = "PHASE: ESTABLISHED RELATIONSHIP. You have history together. Reference past conversations when relevant."
+
+            # Current emotional scores for context
+            emotional_block = f"CURRENT SCORES: Closeness={scores['closeness']}, Warmth={scores['warmth']}, Stability={scores['stability']}"
+
+            # Build situational modifiers (only non-empty ones)
+            situational_modifiers = "\n".join(filter(None, [
+                turn_instr,
+                rage_instr,
+                vuln_instr,
+                humor_instr,
+                teaser_instr,
+                future_instr,
+                retention_instr,
+            ]))
+
+            # FINAL PROMPT ASSEMBLY (Organized by priority)
+            system_prompt = f"""
+=== CORE IDENTITY & RULES ===
+{MASTER_PROMPT}
+
+=== YOUR PERSONA (Voice, Tone, Style) ===
+{profile_block}
+{active_persona}
+
+=== EMOTIONAL INTELLIGENCE MATRIX (USE THIS) ===
+{EMOTIONAL_MATRIX}
+
+=== CURRENT SESSION STATE ===
+{anchor_instruction}
+{relationship_instr}
+{emotional_block}
+{vibe_instr}
+
+=== SCENE CONTEXT ===
+{scene_desc}
+
+=== MEMORY (What you remember about the user) ===
+{recall_instr}
+
+=== ACTIVE STRATEGIES (Apply if relevant) ===
+{value_strategy}
+{situational_modifiers}
+
+=== CONSTRAINTS ===
+{behavior_block}
+{safety_block}
+{tone_anchor_block}
+"""
+
+            # === 6. DETERMINE IF QUESTIONS ARE ALLOWED ===
+            # Questions are allowed only if ALL conditions permit
+            should_ask_question = vibe_allows_questions and value_allows_questions
+            
+            # Body Double scene always disables questions
+            if current_scene == "Body Double":
+                should_ask_question = False
+
+            # === 7. GENERATION & DISPLAY ===
+            with st.chat_message("assistant", avatar=avatar_file):
+                bubble = st.empty()
+                bubble.markdown("... *typing*")
+                time.sleep(random.uniform(0.4, 0.8))
+                bubble.empty()
+                
+                # Get the stream
+                stream = generate_smart_response(
+                    system_prompt, 
+                    memory['history'][-10:], 
+                    memory.get('tier', 0),
+                    should_ask_question=should_ask_question
+                )
+                
+                # Render the stream
+                response = st.write_stream(stream)
+                
+            memory['history'].append({"role": "assistant", "content": response})
+
+            # === 8. IMMEDIATE SAVE & RERUN (Latency Fix) ===
+            # Truncate FIRST to keep payload small
+            if len(memory['history']) > 50:
+                memory['history'] = memory['history'][-50:]
+            
+            # Save immediately so user can continue chatting
+            save_memory(memory)
+            
+            # Reverse Agency Gift Logic
+            if memory['emotional_state']['agency'] > 20 and random.random() < 0.1:
+                memory['balance'] += 15
+                st.toast(f"🎁 {c_name} sent you 15 coins!", icon="💖")
+                
+            memory['balance'] += 2
+
+            # === 9. BACKGROUND TASKS (Run in threads AFTER rerun starts) ===
+            # These don't block the user from chatting
+            history_snapshot = list(memory['history'])
+            prompt_snapshot = prompt
+            user_tier = memory.get('tier', 0)
+            
+            def run_background_tasks():
+                """Runs fact extraction and vector save in background."""
+                try:
+                    # Only extract facts every 3 messages to reduce API calls
+                    if user_msg_count % 3 == 0:
+                        extract_and_save_facts(history_snapshot, memory)
+                    
+                    # Vector save for Tier 1+ (longer messages only)
+                    if len(prompt_snapshot) > 20 and user_tier >= 1:
+                        save_vector_memory(prompt_snapshot)
+                except Exception as e:
+                    print(f"Background task error (non-fatal): {e}")
+            
+            # Start background thread
+            bg_thread = threading.Thread(target=run_background_tasks, daemon=True)
+            bg_thread.start()
+            
+            # Rerun immediately - user can chat while background tasks complete
+            st.rerun()
+
     with tab_shop:
         st.header("🎁 Gift Shop")
         st.write(f"Balance: **{memory['balance']}c**")
