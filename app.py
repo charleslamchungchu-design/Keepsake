@@ -293,14 +293,14 @@ def save_facts_only(new_facts, new_event=None):
             
         current_data = response.data[0]['data']
         
-        # Merge new facts (avoiding duplicates)
+        # Merge new facts (avoiding duplicates, preserving order)
         existing_facts = current_data.get('user_facts', [])
         for fact in new_facts:
             if fact not in existing_facts:
                 existing_facts.append(fact)
         
-        # Keep only last 20 facts
-        current_data['user_facts'] = list(set(existing_facts))[-20:]
+        # Keep only last 20 facts (no set() - preserves insertion order)
+        current_data['user_facts'] = existing_facts[-20:]
         
         # Update event if provided
         if new_event:
