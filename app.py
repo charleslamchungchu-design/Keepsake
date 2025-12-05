@@ -272,14 +272,59 @@ def update_emotional_state(user_text, current_scores):
     for k in current_scores: current_scores[k] = max(0, min(100, current_scores[k]))
     return current_scores
 
-def extract_and_save_facts(history, memory_ref):
+def save_facts_only(new_facts, new_event=None):
     """
-    Extracts facts from conversation and saves to memory.
-    Designed to run in background thread.
+    Thread-safe: Saves ONLY new facts to Supabase without overwriting other memory.
+    Loads current state, merges facts, saves back.
     
     Args:
-        history: Conversation history snapshot
-        memory_ref: Reference to memory dict for saving facts
+        new_facts: List of new fact strings to add
+        new_event: Optional tuple of (event_name, event_date) to save
+    """
+    if not SUPABASE_AVAILABLE or (not new_facts and not new_event):
+        return
+        
+    try:
+        # Load fresh memory state from DB (not the stale in-memory reference)
+        response = supabase.table("memories").select("data").eq("id", USER_ID).execute()
+        
+        if not response.data or len(response.data) == 0:
+            return  # No memory to update
+            
+        current_data = response.data[0]['data']
+        
+        # Merge new facts (avoiding duplicates)
+        existing_facts = current_data.get('user_facts', [])
+        for fact in new_facts:
+            if fact not in existing_facts:
+                existing_facts.append(fact)
+        
+        # Keep only last 20 facts
+        current_data['user_facts'] = list(set(existing_facts))[-20:]
+        
+        # Update event if provided
+        if new_event:
+            event_name, event_date = new_event
+            current_data['active_context']['significant_event'] = event_name
+            current_data['active_context']['event_date'] = event_date
+        
+        # Save merged state back
+        supabase.table("memories").upsert({
+            "id": USER_ID,
+            "data": current_data
+        }).execute()
+        
+    except Exception as e:
+        print(f"Facts save error (non-fatal): {e}")
+
+
+def extract_and_save_facts(history):
+    """
+    Extracts facts from conversation and saves to Supabase.
+    Thread-safe: Does NOT use the global memory reference.
+    
+    Args:
+        history: Conversation history snapshot (list copy, not reference)
     """
     recent_user_text = " ".join([m['content'] for m in history if m['role'] == 'user'][-10:])
     if len(recent_user_text) < 5: 
@@ -301,6 +346,10 @@ def extract_and_save_facts(history, memory_ref):
         )
         result = response.choices[0].message.content
         
+        # Collect extracted data (don't modify any shared state)
+        new_facts = []
+        new_event = None
+        
         lines = result.split('\n')
         for line in lines:
             clean_line = line.strip()
@@ -313,28 +362,26 @@ def extract_and_save_facts(history, memory_ref):
                 parts = clean_line.split(":", 1)
                 if len(parts) > 1 and "none" not in parts[1].lower():
                     content = parts[1].strip()
-                    if content and content not in str(memory_ref.get('user_facts', [])):
-                        memory_ref['user_facts'].append(f"• {content}")
-                        memory_ref['user_facts'] = list(set(memory_ref['user_facts']))[-20:]  # Keep max 20 facts
+                    if content:
+                        new_facts.append(f"• {content}")
                 
             elif "EVENT:" in upper_line:
                 parts = clean_line.split(":", 1)
                 if len(parts) > 1 and "none" not in parts[1].lower():
                     content = parts[1].strip()
                     if content:
-                        memory_ref['active_context']['significant_event'] = content
-                        memory_ref['active_context']['event_date'] = str(datetime.now().date())
+                        new_event = (content, str(datetime.now().date()))
                 
             elif "HUMOR:" in upper_line:
                 parts = clean_line.split(":", 1)
                 if len(parts) > 1 and "none" not in parts[1].lower():
                     content = parts[1].strip()
                     if content:
-                        memory_ref['user_facts'].append(f"• JOKE: {content}")
-                        memory_ref['user_facts'] = list(set(memory_ref['user_facts']))[-20:]
+                        new_facts.append(f"• JOKE: {content}")
         
-        # Save after extraction (background save)
-        save_memory(memory_ref)
+        # Thread-safe save: loads fresh DB state, merges facts, saves
+        if new_facts or new_event:
+            save_facts_only(new_facts, new_event)
                     
     except Exception as e:
         print(f"Fact extraction error (non-fatal): {e}")
@@ -871,17 +918,23 @@ else: # CHAT ROOM
             memory['balance'] += 2
 
             # === 9. BACKGROUND TASKS (Run in threads AFTER rerun starts) ===
-            # These don't block the user from chatting
-            history_snapshot = list(memory['history'])
-            prompt_snapshot = prompt
-            user_tier = memory.get('tier', 0)
+            # These don't block the user - they run while user can continue chatting
+            # IMPORTANT: Only pass COPIES of data, never references to global memory
+            history_snapshot = list(memory['history'])  # Copy of history
+            prompt_snapshot = prompt  # String is immutable, safe to pass
+            user_tier = memory.get('tier', 0)  # Primitive value copy
+            should_extract = (user_msg_count % 3 == 0)  # Decide now, not in thread
             
             def run_background_tasks():
-                """Runs fact extraction and vector save in background."""
+                """
+                Runs fact extraction and vector save in background.
+                Thread-safe: Does NOT modify or save the global memory object.
+                """
                 try:
-                    # Only extract facts every 3 messages to reduce API calls
-                    if user_msg_count % 3 == 0:
-                        extract_and_save_facts(history_snapshot, memory)
+                    # Fact extraction (every 3 messages to reduce API calls)
+                    # Uses thread-safe save_facts_only() which loads fresh DB state
+                    if should_extract:
+                        extract_and_save_facts(history_snapshot)
                     
                     # Vector save for Tier 1+ (longer messages only)
                     if len(prompt_snapshot) > 20 and user_tier >= 1:
