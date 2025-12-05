@@ -152,9 +152,11 @@ def generate_smart_response(system_prompt, history, tier, persona_text=""):
     # 3. STRICT STYLE ENFORCEMENT (Added to end of prompt)
     style_enforcement = f"""
     [SYSTEM OVERRIDE]
-    1. CRITICAL: DO NOT GIVE ADVICE. Do not say "take a break" or "step back".
-    2. CRITICAL: Be concise. Keep response under 2 sentences if the user is tired.
-    3. TONE: {persona_text}
+    [SYSTEM WAKE-UP CALL]
+    1. RECALL THE FILES: Look back at the 'EMOTIONAL_MATRIX' and 'MASTER_PROMPT' provided at the start of this context.
+    2. ACTIVATE: Find the rule in the Matrix that matches the user's current emotion (e.g., if Tired -> Permission; if Angry -> Protection).
+    3. RULE: Do not be a passive listener. Do not give advice.
+    4. ACTION: Use the specific strategy from the Matrix to ask ONE Deep Question that moves the conversation forward.
     """
     
     msgs = [{"role": "system", "content": system_prompt}] + history
