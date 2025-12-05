@@ -136,46 +136,34 @@ def retrieve_context(query):
 
 def generate_smart_response(system_prompt, history, tier, persona_text=""):
     """
-    GPT-HYBRID ROUTER (Clean Logic Only):
-    - Returns the raw stream generator. Does NOT write to screen.
+    REROUTING LOGIC: Returns a stream. Does NOT write to UI.
     """
-    
-    # 1. ANALYZE CONTEXT
     last_msg = history[-1]['content'].lower() if history else ""
-    
-    deep_triggers = [
-        "divorce", "fired", "sad", "upset", "anxious", "lonely", "fail", 
-        "broken", "worry", "hurt", "grief", "advice", "opinion",
-        "perspective", "relationship", "scared", "depressed"
-    ]
-    
+    deep_triggers = ["sad", "upset", "anxious", "lonely", "fail", "broken", "worry", "hurt", "grief", "depressed", "tired", "exhausted"]
     is_deep = (any(t in last_msg for t in deep_triggers) or len(last_msg) > 60)
     
-    # 2. SELECT ENGINE
-    # Logic: If Tier 2+ AND Topic is Deep -> Use Smart Model
+    # 1. Select Model (Smart Rerouting)
     if tier >= 2 and is_deep:
-        active_model = "gpt-4o"
-        print(f"🔎 DEBUG: Routing to GPT-4o (Deep Mode)")
+        active_model = "gpt-4o" # Smartest for deep talks
+        print("DEBUG: Routing to GPT-4o")
     else:
-        active_model = "gpt-4o-mini"
-        print(f"🔎 DEBUG: Routing to GPT-4o-mini (Casual Mode)")
+        active_model = "gpt-4o-mini" # Fast for casual
+        print("DEBUG: Routing to Mini")
 
-    # 3. STYLE INJECTION
-    style_guide = f"""
-    IDENTITY: {persona_text}
-    STRICT BEHAVIORAL RULES:
-    1. Be grounded, calm, and concise.
-    2. NO "Assistant" fluff (e.g., "How can I help?").
-    3. NO unsolicited advice. Just be a friend.
-    4. If the user is sad, acknowledge it simply. Do not write a paragraph of validation.
-    5. Speak naturally, using lowercase if the persona allows.
+    # 2. Strict Style Enforcement (Appended to end to prevent ignoring)
+    style_enforcement = f"""
+    [SYSTEM OVERRIDE - HIGH PRIORITY]
+    1. CRITICAL: DO NOT GIVE ADVICE. Do not say "take a break" or "step back".
+    2. CRITICAL: Be concise. Keep response under 2 sentences if the user is tired.
+    3. IDENTITY: You are a friend, NOT a therapist. Stop validating so much. Just be there.
+    4. TONE: {persona_text}
     """
     
-    # 4. GENERATION
-    full_system_msg = f"{system_prompt}\n\n{style_guide}"
-    msgs = [{"role": "system", "content": full_system_msg}] + history
+    # 3. Compile Messages
+    msgs = [{"role": "system", "content": system_prompt}] + history
+    msgs.append({"role": "system", "content": style_enforcement}) # Last thing it reads!
     
-    # RETURN THE STREAM (Do not st.write it here!)
+    # 4. Return Stream (No UI code here to prevent freezing)
     return client.chat.completions.create(
         model=active_model, 
         messages=msgs, 
