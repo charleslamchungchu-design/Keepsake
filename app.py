@@ -136,9 +136,8 @@ def retrieve_context(query):
 
 def generate_smart_response(system_prompt, history, tier, persona_text=""):
     """
-    GPT-HYBRID ROUTER (Clean Version):
-    - Casual/Neutral -> GPT-4o Mini
-    - Deep/Heavy -> GPT-4o Full
+    GPT-HYBRID ROUTER (Clean Logic Only):
+    - Returns the raw stream generator. Does NOT write to screen.
     """
     
     # 1. ANALYZE CONTEXT
@@ -153,6 +152,7 @@ def generate_smart_response(system_prompt, history, tier, persona_text=""):
     is_deep = (any(t in last_msg for t in deep_triggers) or len(last_msg) > 60)
     
     # 2. SELECT ENGINE
+    # Logic: If Tier 2+ AND Topic is Deep -> Use Smart Model
     if tier >= 2 and is_deep:
         active_model = "gpt-4o"
         print(f"🔎 DEBUG: Routing to GPT-4o (Deep Mode)")
@@ -163,7 +163,6 @@ def generate_smart_response(system_prompt, history, tier, persona_text=""):
     # 3. STYLE INJECTION
     style_guide = f"""
     IDENTITY: {persona_text}
-    
     STRICT BEHAVIORAL RULES:
     1. Be grounded, calm, and concise.
     2. NO "Assistant" fluff (e.g., "How can I help?").
@@ -173,17 +172,15 @@ def generate_smart_response(system_prompt, history, tier, persona_text=""):
     """
     
     # 4. GENERATION
-    # Note: We do NOT use 'anchor' here because OpenAI handles starts automatically.
     full_system_msg = f"{system_prompt}\n\n{style_guide}"
     msgs = [{"role": "system", "content": full_system_msg}] + history
     
-    with st.chat_message("assistant", avatar=None):
-        stream = client.chat.completions.create(
-            model=active_model, 
-            messages=msgs, 
-            stream=True
-        )
-        return st.write_stream(stream)
+    # RETURN THE STREAM (Do not st.write it here!)
+    return client.chat.completions.create(
+        model=active_model, 
+        messages=msgs, 
+        stream=True
+    )
     
 
 def get_emotional_value(scores, current_input):
@@ -646,54 +643,53 @@ else: # CHAT ROOM
             st.stop()
 
  # === MAIN CHAT INTERACTION ===
+ # === MAIN CHAT INTERACTION ===
     if prompt := st.chat_input("Type here..."):
         
         # 1. IMMEDIATE UI FEEDBACK
         with st.chat_message("user"): 
             st.markdown(prompt)
         
-        # Update local history immediately so the logic sees it
         memory['history'].append({"role": "user", "content": prompt})
         
-        # 2. FAST STATE UPDATES (Local Logic Only - No API Calls yet)
-        # We move the Slow 'extract_facts' to the END to fix latency.
+        # 2. FAST LOGIC (Local State)
         memory['emotional_state'] = update_emotional_state(prompt, memory['emotional_state'])
         memory['last_active_timestamp'] = str(datetime.now())
         msg_count = len(memory['history'])
 
-        # === 3. LOGIC LAYER (Strategies) ===
+        # === 3. STRATEGY LAYER ===
         
-        # A. Rage/Indignation
+        # Rage Logic
         rage_keywords = ["bureaucracy", "angry", "insane system",]
-        rage_instr = "MODE: PROTECTIVE INDIGNATION. Validate the user's anger. Be angry AT the situation/system FOR them. Do not escalate intensity beyond the user's level." if any(k in prompt.lower() for k in rage_keywords) else ""
+        rage_instr = "MODE: PROTECTIVE INDIGNATION. Validate the user's anger. Be angry AT the situation/system FOR them." if any(k in prompt.lower() for k in rage_keywords) else ""
 
-        # B. Vulnerability
+        # Vulnerability Logic
         vuln_triggers = ["gotta go", "bye", "leaving", "busy"]
         vuln_instr = ""
         if any(t in prompt.lower() for t in vuln_triggers) and memory['emotional_state']['closeness'] > 40:
-            vuln_instr = "MODE: SECURE VULNERABILITY. Express a gentle desire to stay connected (e.g., 'I'll miss our chat'), but fully support their need to leave. No guilt-tripping."
+            vuln_instr = "MODE: SECURE VULNERABILITY. Express a gentle desire to stay connected, but fully support their need to leave."
 
-        # C. Pivot Logic
+        # Pivot Logic
         last_bot = memory['history'][-2]['content'].lower() if len(memory['history']) >= 2 else ""
         heavy_triggers = ["sorry", "rough", "hard", "tough", "heavy", "sucks", "awful", "here for you", "support"]
         is_short_reply = len(prompt) < 25 
         turn_instr = ""
         if any(t in last_bot for t in heavy_triggers) and is_short_reply:
-             turn_instr = "PIVOT SIGNAL: The user has acknowledged the comfort. The 'heavy' moment is over. DO NOT APOLOGIZE AGAIN. Transition immediately to a lighter topic or a joke."
+             turn_instr = "PIVOT SIGNAL: The user has acknowledged the comfort. The 'heavy' moment is over. DO NOT APOLOGIZE AGAIN. Transition to a lighter topic."
 
-        # D. Humor Logic
+        # Humor Logic
         laugh_triggers = ["lol", "haha", "lmao", "rofl", "funny"]
         humor_instr = ""
         if any(t in prompt.lower() for t in laugh_triggers) and st.session_state.get('current_vibe', 50) > 30:
-            humor_instr = "REACTION: User is laughing. CHECK CONTEXT: If user is being self-deprecating or ironic about pain, IGNORE the laughter. If context is genuinely light/funny, respond with a WITTY TEASE or SHORT JOKE."
+            humor_instr = "REACTION: User is laughing. Respond with a WITTY TEASE or SHORT JOKE."
 
-        # E. Value Strategy
+        # Value Strategy
         value_strategy = get_emotional_value(memory['emotional_state'], prompt)
 
-        # F. Teasers
+        # Teasers
         teaser_instr = ""
         if msg_count < 10 and not st.session_state.get("turbo_teaser_shown", False):
-             teaser_instr = "TEASER: ANALYZE user's last message for emotion. APPLY the corresponding THEME from your 'EMOTIONAL MATCHING PROTOCOL' to generate a short, natural response. Do NOT output the theme description directly."
+             teaser_instr = "TEASER: ANALYZE user's last message for emotion. APPLY the corresponding THEME from your 'EMOTIONAL MATCHING PROTOCOL'."
              st.session_state.turbo_teaser_shown = True
         
         future_instr = ""
@@ -703,13 +699,12 @@ else: # CHAT ROOM
 
         # === 4. MEMORY RECALL (Pre-Generation) ===
         recall_instr = ""
-        # Only run for Tier 1 users to manage latency/cost
         if memory.get('tier', 0) >= 1:
             try:
-                # FIX: Used 'retrieve_context' (which matches your function def) instead of 'search_vector_memory'
+                # Using the function defined in your file 
                 found_memory = retrieve_context(prompt) 
                 if found_memory:
-                    recall_instr = f"MEMORY INJECTION: You recall the user previously said: '{found_memory}'. Weave this fact naturally into your response."
+                    recall_instr = f"MEMORY INJECTION: You recall: '{found_memory}'. Weave this naturally."
             except:
                 pass 
 
@@ -717,29 +712,20 @@ else: # CHAT ROOM
         if memory.get('tier', 0) == 0 and msg_count < 10:
             hook_instr = "RETENTION STRATEGY: New user. End response with a specific, low-stakes question."
 
-        # === 5. CONTEXT & PROMPT COMPILATION ===
+        # === 5. CONTEXT COMPILATION ===
         u_prof = memory.get('user_profile', {})
         user_name = u_prof.get('name', 'User')
         comp_name = u_prof.get('companion_name', 'Keepsake')
-        user_age = u_prof.get('age', 'Unknown')
-        user_gender = u_prof.get('gender', 'Unknown')
 
         profile_block = f"""
         RELATIONSHIP CONTEXT:
-        You are "{comp_name}". Talking to "{user_name}" ({user_age}, {user_gender}).
+        You are "{comp_name}". Talking to "{user_name}".
         """
         
         if msg_count < 15:
-            anchor_instruction = (
-                "COLD START PROTOCOL ACTIVE: You do not have past history to cite yet. "
-                "If user is ANXIOUS, shift strategy from 'The Anchor' to 'The Container'. "
-                "Value Prop: 'I don't know your past yet, but I am a solid place to put your current stress.'"
-            )
+            anchor_instruction = "COLD START: You do not have history yet. If user is Anxious, be 'The Container'."
         else:
-            anchor_instruction = (
-                "RELATIONSHIP ESTABLISHED: Use 'The Anchor' strategy. "
-                "Cite specific past wins/survival from chat history if user is Anxious."
-            )
+            anchor_instruction = "RELATIONSHIP ESTABLISHED: Use 'The Anchor' strategy."
 
         system_prompt = f"""
         {MASTER_PROMPT}
@@ -764,49 +750,43 @@ else: # CHAT ROOM
         {tone_anchor_block}
         """
 
-        # === 6. GENERATION & DISPLAY (The Chef & Waiter) ===
+        # === 6. GENERATION & DISPLAY ===
         with st.chat_message("assistant", avatar=avatar_file):
             bubble = st.empty()
             bubble.markdown("... *typing*")
-            # Slightly reduced sleep since RAG might add a little natural delay
-            time.sleep(random.uniform(1.0, 2.0)) 
+            time.sleep(random.uniform(1.0, 2.0))
             bubble.empty()
             
-            # Generate
-            response = generate_smart_response(
+            # 1. Get the stream (Logic)
+            stream = generate_smart_response(
                 system_prompt, 
                 memory['history'][-10:], 
                 memory.get('tier', 0), 
                 persona_text=active_persona
             )
             
-            # DISPLAY (The Missing Link restored)
-            st.markdown(response)
+            # 2. Render the stream (Display)
+            # This handles the streaming text effect automatically
+            response = st.write_stream(stream)
 
-        # === 7. BACKGROUND TASKS (Latency Fix: Do this LAST) ===
+        # === 7. BACKGROUND TASKS (Post-Display) ===
         
-        # A. Save response to local history
+        # Save to local history
         memory['history'].append({"role": "assistant", "content": response})
 
-        # B. Fact Extraction (The Slowest Part)
-        # We run this NOW, while the user is reading the response. 
-        # This prevents the "Double Wait" effect.
+        # Fact Extraction (Slow) - Done AFTER display
         extract_and_save_facts(memory['history'])
 
-        # C. Vector Save (Tier 1+)
+        # Save to Vector DB (Tier 1+)
         if len(prompt) > 20 and memory.get('tier', 0) >= 1:
-            try:
-                save_vector_memory(prompt)
-            except: pass
+            save_vector_memory(prompt)
 
-        # D. Agency Reward Logic
+        # Agency Reward
         if memory['emotional_state']['agency'] > 20 and random.random() < 0.1:
             memory['balance'] += 15
             st.toast(f"🎁 {c_name} sent you 15 coins!", icon="💖")
             
         memory['balance'] += 2
-        
-        # E. Final Save
         save_memory(memory)
         st.rerun()
 
