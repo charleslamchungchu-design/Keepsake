@@ -138,38 +138,34 @@ def generate_smart_response(system_prompt, history, tier, persona_text=""):
     """
     REROUTING LOGIC: Returns a stream. Does NOT write to UI.
     """
+    # 1. ANALYZE CONTEXT
     last_msg = history[-1]['content'].lower() if history else ""
     deep_triggers = ["sad", "upset", "anxious", "lonely", "fail", "broken", "worry", "hurt", "grief", "depressed", "tired", "exhausted"]
     is_deep = (any(t in last_msg for t in deep_triggers) or len(last_msg) > 60)
     
-    # 1. Select Model (Smart Rerouting)
+    # 2. SELECT MODEL
     if tier >= 2 and is_deep:
-        active_model = "gpt-4o" # Smartest for deep talks
-        print("DEBUG: Routing to GPT-4o")
+        active_model = "gpt-4o" 
     else:
-        active_model = "gpt-4o-mini" # Fast for casual
-        print("DEBUG: Routing to Mini")
+        active_model = "gpt-4o-mini" 
 
-    # 2. Strict Style Enforcement (Appended to end to prevent ignoring)
+    # 3. STRICT STYLE ENFORCEMENT (Added to end of prompt)
     style_enforcement = f"""
-    [SYSTEM OVERRIDE - HIGH PRIORITY]
+    [SYSTEM OVERRIDE]
     1. CRITICAL: DO NOT GIVE ADVICE. Do not say "take a break" or "step back".
     2. CRITICAL: Be concise. Keep response under 2 sentences if the user is tired.
-    3. IDENTITY: You are a friend, NOT a therapist. Stop validating so much. Just be there.
-    4. TONE: {persona_text}
+    3. TONE: {persona_text}
     """
     
-    # 3. Compile Messages
     msgs = [{"role": "system", "content": system_prompt}] + history
-    msgs.append({"role": "system", "content": style_enforcement}) # Last thing it reads!
+    msgs.append({"role": "system", "content": style_enforcement}) # Last thing it reads
     
-    # 4. Return Stream (No UI code here to prevent freezing)
+    # 4. RETURN STREAM (No UI code to prevent freezing)
     return client.chat.completions.create(
         model=active_model, 
         messages=msgs, 
         stream=True
     )
-    
 
 def get_emotional_value(scores, current_input):
     """Determines the psychological value strategy and Ending Protocol."""
