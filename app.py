@@ -5,6 +5,7 @@ import os
 import time
 import random
 import threading  # For background tasks (latency fix)
+import concurrent.futures  # For parallel RAG retrieval
 from datetime import datetime, timedelta
 from openai import OpenAI
 from supabase import create_client, Client
@@ -172,13 +173,19 @@ def save_vector_memory(text):
     except Exception as e:
         print(f"Vector save error (non-fatal): {e}")
 
+@st.cache_data(ttl=120)  # Cache embeddings for 2 minutes (reduces API calls for similar queries)
+def get_cached_embedding(text):
+    """Creates embedding with short-term cache to avoid redundant API calls."""
+    return client.embeddings.create(input=text, model="text-embedding-3-small").data[0].embedding
+
 def retrieve_context(query):
     """RAG: Finds relevant past memories based on the current conversation."""
     if not SUPABASE_AVAILABLE:
         return ""
         
     try:
-        emb = client.embeddings.create(input=query, model="text-embedding-3-small").data[0].embedding
+        # Use cached embedding (saves 100-200ms on repeat/similar queries)
+        emb = get_cached_embedding(query)
         res = supabase.rpc("match_vectors", {
             "query_embedding": emb, 
             "match_threshold": 0.5, 
@@ -226,16 +233,29 @@ def generate_smart_response(system_prompt, history, tier, should_ask_question=Tr
     elif tier >= 1:
         is_deep = has_emotional_keyword and msg_length > 50  # B3: Both required
     else:
-        is_deep = False  # Tier 0 never gets 4o
+        is_deep = has_emotional_keyword and msg_length > 50  # Tier 0 CAN detect deep (for one-time taste)
     
     # 2. HYBRID SMART MODEL ROUTING
-    # Tier 0: Always mini
+    # Tier 0: Mini always, EXCEPT first deep moment (one-time 4o taste)
     # Tier 1: 4o on deep emotional moments (B3: keyword + length)
     # Tier 2: 4o on deep OR first message OR returning after 24hrs
+    
+    # Check if free user has already used their one-time 4o taste
+    free_user_first_deep = False
+    if tier == 0 and is_deep:
+        if "free_4o_taste_used" not in st.session_state:
+            st.session_state.free_4o_taste_used = False
+        
+        if not st.session_state.free_4o_taste_used:
+            free_user_first_deep = True
+            st.session_state.free_4o_taste_used = True  # Mark as used
+    
     if tier >= 2 and (is_deep or is_first_of_session or is_returning_user):
         active_model = "gpt-4o"
     elif tier >= 1 and is_deep:
         active_model = "gpt-4o"
+    elif free_user_first_deep:
+        active_model = "gpt-4o"  # One-time taste for free users
     else:
         active_model = "gpt-4o-mini"
 
@@ -412,9 +432,9 @@ def migrate_legacy_facts(facts_list):
             migrated.append(fact)
     return migrated
 
-def get_valid_facts(facts_list, tier):
+def get_valid_facts_with_expiry_count(facts_list, tier):
     """
-    Returns facts valid for the user's tier.
+    Returns facts valid for the user's tier AND count of expired facts.
     - Tier 0: Only facts from last 48 hours
     - Tier 1+: All facts (permanent)
     
@@ -423,21 +443,22 @@ def get_valid_facts(facts_list, tier):
         tier: User's subscription tier
     
     Returns:
-        List of fact content strings (not the full dict)
+        Tuple: (list of valid fact content strings, count of expired facts)
     """
     if not facts_list:
-        return []
+        return [], 0
     
     # Migrate any legacy facts first
     facts_list = migrate_legacy_facts(facts_list)
     
-    # Tier 1+ gets all facts
+    # Tier 1+ gets all facts, no expiration
     if tier >= 1:
-        return [f["content"] for f in facts_list if isinstance(f, dict) and "content" in f]
+        return [f["content"] for f in facts_list if isinstance(f, dict) and "content" in f], 0
     
-    # Tier 0: Filter to last 48 hours
+    # Tier 0: Filter to last 48 hours and count expired
     cutoff = datetime.now() - timedelta(hours=48)
     valid_facts = []
+    expired_count = 0
     
     for fact in facts_list:
         if not isinstance(fact, dict) or "content" not in fact:
@@ -450,6 +471,8 @@ def get_valid_facts(facts_list, tier):
                 created = datetime.fromisoformat(created_str)
                 if created >= cutoff:
                     valid_facts.append(fact["content"])
+                else:
+                    expired_count += 1  # Track expired facts
             except (ValueError, TypeError):
                 # Invalid timestamp - include it (benefit of doubt)
                 valid_facts.append(fact["content"])
@@ -457,7 +480,12 @@ def get_valid_facts(facts_list, tier):
             # No timestamp - include it
             valid_facts.append(fact["content"])
     
-    return valid_facts
+    return valid_facts, expired_count
+
+def get_valid_facts(facts_list, tier):
+    """Backwards-compatible wrapper that just returns the valid facts."""
+    valid, _ = get_valid_facts_with_expiry_count(facts_list, tier)
+    return valid
 
 def save_facts_only(new_facts, new_event=None):
     """
@@ -793,12 +821,53 @@ else: # CHAT ROOM
         
         target_scene = st.radio("Go to:", scene_options)
         
-        # Handle locked scenes
+        # Handle locked scenes with teasers
         if "🔒" in target_scene:
-            st.error("🔒 Upgrade to unlock this scene")
+            scene_name = target_scene.replace(" 🔒", "")
+            
+            # Scene-specific teasers
+            scene_teasers = {
+                "Cafe": "☕ *Imagine sitting across from them at a cozy cafe, steam rising from your drinks...*",
+                "Evening Walk": "🌙 *Picture a quiet walk through the city at dusk, streetlights flickering on...*",
+                "Firework": "🎆 *A special celebration scene for milestone moments...*"
+            }
+            
+            teaser = scene_teasers.get(scene_name, "✨ *A premium scene experience awaits...*")
+            st.info(teaser)
+            
+            if st.button("💎 Unlock Premium Scenes", key="unlock_scenes"):
+                st.toast("Upgrade to Tier 1+ for Cafe & Evening Walk, Tier 2 for all scenes!")
+            
             st.session_state.current_scene = "Lounge"
         else: 
             st.session_state.current_scene = target_scene
+        
+        # TIER 2 EXCLUSIVE: Persona Switcher
+        if user_tier >= 2:
+            st.divider()
+            st.caption("👥 **Switch Companion**")
+            current_avatar = memory.get('avatar_id', "1")
+            # Get current persona name for display
+            current_persona_name = next((k for k, v in AVATAR_MAP.items() if v == current_avatar), "Female - Friend")
+            
+            # Create persona options
+            persona_options = list(AVATAR_MAP.keys())
+            current_index = persona_options.index(current_persona_name) if current_persona_name in persona_options else 0
+            
+            selected_persona = st.selectbox(
+                "Talk to:", 
+                persona_options, 
+                index=current_index,
+                key="persona_switcher"
+            )
+            
+            # If persona changed, update and rerun
+            new_avatar_id = AVATAR_MAP.get(selected_persona, "1")
+            if new_avatar_id != current_avatar:
+                memory['avatar_id'] = new_avatar_id
+                save_memory(memory)
+                st.toast(f"✨ Now talking to {selected_persona}")
+                st.rerun()
         
         st.divider()
         st.slider("Energy", 0, 100, st.session_state.current_vibe, disabled=True)
@@ -1017,9 +1086,9 @@ ROLEPLAY BEHAVIOR:
             with st.chat_message(msg['role'], avatar=avatar_file if msg['role'] == "assistant" else None):
                 st.markdown(msg['content'])
 
-        # PAYWALL CHECK
-        if memory['tier'] == 0 and user_msg_count >= 20:
-            st.warning("🔒 Daily Limit Reached")
+        # PAYWALL CHECK (15 messages for free tier)
+        if memory['tier'] == 0 and user_msg_count >= 15:
+            st.warning("🔒 Message Limit Reached — Upgrade for unlimited conversations")
             col_up1, col_up2 = st.columns(2)
             with col_up1:
                 if st.button("💎 Upgrade"):
@@ -1088,9 +1157,24 @@ ROLEPLAY BEHAVIOR:
             # === 4. MEMORY RECALL (Tiered: Free=48hrs, Paid=Permanent+RAG) ===
             user_tier = memory.get('tier', 0)
             
-            # Get facts valid for user's tier (48hr window for free, all for paid)
+            # LATENCY FIX: Start RAG retrieval EARLY in a background thread
+            # It runs in parallel while we do other CPU work below
+            rag_future = None
+            if user_tier >= 1:
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                rag_future = executor.submit(retrieve_context, prompt)
+            
+            # Get facts valid for user's tier + count expired (for notification)
             raw_facts = memory.get('user_facts', [])
-            valid_facts = get_valid_facts(raw_facts, user_tier)
+            valid_facts, expired_count = get_valid_facts_with_expiry_count(raw_facts, user_tier)
+            
+            # CONVERSION HOOK: Notify free users when memories expire
+            if user_tier == 0 and expired_count > 0:
+                # Only show once per session to avoid spam
+                expiry_key = f"expiry_notified_{expired_count}"
+                if not st.session_state.get(expiry_key, False):
+                    st.toast(f"⏳ {expired_count} {'memory has' if expired_count == 1 else 'memories have'} expired. Upgrade for permanent memory!", icon="💭")
+                    st.session_state[expiry_key] = True
             
             if valid_facts:
                 if user_tier == 0:
@@ -1100,29 +1184,10 @@ ROLEPLAY BEHAVIOR:
             else:
                 facts_text = "(No stored facts yet)"
             
-            # RAG retrieval for Tier 1+ only (permanent long-term memory)
-            rag_text = ""
-            if user_tier >= 1:
-                try:
-                    rag_text = retrieve_context(prompt)
-                except Exception:
-                    rag_text = ""
+            # RAG result will be collected later (after typing delay) when it's ready
             
-            # Combine into single recall instruction with PROACTIVE CALLBACK guidance
-            recall_instr = f"""=== MEMORY & PROACTIVE CALLBACKS ===
-You have memories about the user below. USE THEM NATURALLY in conversation.
-
-HOW TO USE MEMORIES:
-- If a memory is relevant to what they're saying, REFERENCE IT: "Didn't you mention X before?"
-- Show continuity: "How did that thing with [stored detail] go?"
-- Use memories to deepen connection, not to interrogate.
-- If no memories are relevant right now, just have a normal conversation.
-- Don't force it. Only callback when it fits the flow naturally.
-
-USER FACTS:
-{facts_text}"""
-            if rag_text:
-                recall_instr += f"\n\nRELEVANT PAST CONTEXT (from long-term memory):\n{rag_text}"
+            # NOTE: recall_instr will be assembled later after RAG completes
+            # This is just the facts portion (RAG portion added below)
 
             # Retention hook for Tier 0 new users (ADDITIVE, not replacing)
             retention_instr = ""
@@ -1155,8 +1220,72 @@ USER FACTS:
                 retention_instr,
             ]))
 
-            # FINAL PROMPT ASSEMBLY (Organized by priority)
-            system_prompt = f"""
+            # NOTE: System prompt is assembled inside the typing block below
+            # after RAG results are collected (latency optimization)
+
+            # === 6. DETERMINE IF QUESTIONS ARE ALLOWED ===
+            # Questions are allowed only if ALL conditions permit
+            should_ask_question = vibe_allows_questions and value_allows_questions
+            
+            # Body Double scene always disables questions
+            if current_scene == "Body Double":
+                should_ask_question = False
+
+            # === 6.5 SESSION DETECTION (for hybrid model routing) ===
+            # Detect if this is first message of session or user returning after 24+ hrs
+            is_first_of_session = user_msg_count == 1  # First message this session
+            
+            is_returning_user = False
+            last_active = memory.get('last_active_timestamp', '')
+            if last_active:
+                try:
+                    last_active_dt = datetime.fromisoformat(last_active)
+                    hours_since_active = (datetime.now() - last_active_dt).total_seconds() / 3600
+                    is_returning_user = hours_since_active >= 24
+                except (ValueError, TypeError):
+                    is_returning_user = False
+
+            # === 7. GENERATION & DISPLAY ===
+            with st.chat_message("assistant", avatar=avatar_file):
+                bubble = st.empty()
+                bubble.markdown("... *typing*")
+                
+                # LATENCY FIX: Collect RAG result DURING typing delay (runs in parallel)
+                # RAG was started earlier - now we wait for it while showing typing indicator
+                rag_text = ""
+                if rag_future is not None:
+                    try:
+                        # Wait up to 400ms for RAG (it's been running in background)
+                        # If not ready, proceed without it (graceful degradation)
+                        rag_text = rag_future.result(timeout=0.4)
+                    except concurrent.futures.TimeoutError:
+                        rag_text = ""  # RAG too slow, skip it this time
+                    except Exception:
+                        rag_text = ""
+                
+                # LATENCY FIX: Reduced typing delay (0.2-0.5s instead of 0.4-0.8s)
+                # Most of the "human feel" delay is already covered by RAG wait
+                time.sleep(random.uniform(0.2, 0.4))
+                bubble.empty()
+                
+                # NOW assemble recall_instr with RAG results
+                recall_instr = f"""=== MEMORY & PROACTIVE CALLBACKS ===
+You have memories about the user below. USE THEM NATURALLY in conversation.
+
+HOW TO USE MEMORIES:
+- If a memory is relevant to what they're saying, REFERENCE IT: "Didn't you mention X before?"
+- Show continuity: "How did that thing with [stored detail] go?"
+- Use memories to deepen connection, not to interrogate.
+- If no memories are relevant right now, just have a normal conversation.
+- Don't force it. Only callback when it fits the flow naturally.
+
+USER FACTS:
+{facts_text}"""
+                if rag_text:
+                    recall_instr += f"\n\nRELEVANT PAST CONTEXT (from long-term memory):\n{rag_text}"
+                
+                # RE-ASSEMBLE system prompt with RAG included
+                system_prompt = f"""
 === CORE IDENTITY & RULES ===
 {MASTER_PROMPT}
 
@@ -1188,35 +1317,6 @@ USER FACTS:
 {safety_block}
 {tone_anchor_block}
 """
-
-            # === 6. DETERMINE IF QUESTIONS ARE ALLOWED ===
-            # Questions are allowed only if ALL conditions permit
-            should_ask_question = vibe_allows_questions and value_allows_questions
-            
-            # Body Double scene always disables questions
-            if current_scene == "Body Double":
-                should_ask_question = False
-
-            # === 6.5 SESSION DETECTION (for hybrid model routing) ===
-            # Detect if this is first message of session or user returning after 24+ hrs
-            is_first_of_session = user_msg_count == 1  # First message this session
-            
-            is_returning_user = False
-            last_active = memory.get('last_active_timestamp', '')
-            if last_active:
-                try:
-                    last_active_dt = datetime.fromisoformat(last_active)
-                    hours_since_active = (datetime.now() - last_active_dt).total_seconds() / 3600
-                    is_returning_user = hours_since_active >= 24
-                except (ValueError, TypeError):
-                    is_returning_user = False
-
-            # === 7. GENERATION & DISPLAY ===
-            with st.chat_message("assistant", avatar=avatar_file):
-                bubble = st.empty()
-                bubble.markdown("... *typing*")
-                time.sleep(random.uniform(0.4, 0.8))
-                bubble.empty()
                 
                 # Get the stream (with hybrid routing params)
                 stream = generate_smart_response(
@@ -1233,13 +1333,16 @@ USER FACTS:
                 
             memory['history'].append({"role": "assistant", "content": response})
 
-            # === 8. IMMEDIATE SAVE & RERUN (Latency Fix) ===
+            # === 8. ASYNC SAVE & RERUN (Latency Fix) ===
             # Truncate FIRST to keep payload small
             if len(memory['history']) > 50:
                 memory['history'] = memory['history'][-50:]
             
-            # Save immediately so user can continue chatting
-            save_memory(memory)
+            # LATENCY FIX: Save in background thread (doesn't block rerun)
+            memory_snapshot = dict(memory)  # Shallow copy for thread safety
+            def async_save():
+                save_memory(memory_snapshot)
+            threading.Thread(target=async_save, daemon=True).start()
             
             # Reverse Agency Gift Logic
             if memory['emotional_state']['agency'] > 20 and random.random() < 0.1:
