@@ -1,0 +1,30 @@
+# Keepsake API Dependencies
+# Install with: pip install -r api/requirements.txt
+
+# FastAPI & Server
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+
+# Pydantic (settings & validation)
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# OpenAI
+openai>=1.0.0
+
+# Supabase
+supabase>=2.0.0
+
+# Auth / JWT
+PyJWT>=2.8.0
+
+# HTTP Client (for Supabase)
+httpx>=0.26.0
+
+# Async support
+anyio>=4.0.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
