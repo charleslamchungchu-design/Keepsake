@@ -193,7 +193,7 @@ def retrieve_context(query):
         print(f"RAG retrieval error (non-fatal): {e}")
         return ""
 
-def generate_smart_response(system_prompt, history, tier, should_ask_question=True):
+def generate_smart_response(system_prompt, history, tier, should_ask_question=True, is_first_of_session=False, is_returning_user=False):
     """
     REROUTING LOGIC: Returns a stream. Does NOT write to UI.
     
@@ -202,33 +202,79 @@ def generate_smart_response(system_prompt, history, tier, should_ask_question=Tr
         history: Recent conversation history
         tier: User's subscription tier (affects model selection)
         should_ask_question: Whether the style enforcement should encourage questions
+        is_first_of_session: Whether this is the first message of the current session
+        is_returning_user: Whether user is returning after 24+ hours absence
     """
     # 1. ANALYZE CONTEXT FOR MODEL ROUTING
     last_msg = history[-1]['content'].lower() if history else ""
-    deep_triggers = ["sad", "upset", "anxious", "lonely", "fail", "broken", "worry", "hurt", 
-                     "grief", "depressed", "tired", "exhausted", "scared", "angry", "frustrated",
-                     "hopeless", "overwhelmed", "stressed", "crying", "panic"]
-    is_deep = (any(t in last_msg for t in deep_triggers) or len(last_msg) > 80)
+    msg_length = len(last_msg)
     
-    # 2. SELECT MODEL (GPT-4o for deep emotional content at Tier 2+)
-    if tier >= 2 and is_deep:
-        active_model = "gpt-4o" 
+    # Deep emotional triggers (includes positive emotions too)
+    deep_triggers = ["sad", "upset", "anxious", "lonely", "fail", "broken", "worry", "hurt", 
+                     "grief", "depressed", "exhausted", "scared", "angry", "frustrated",
+                     "hopeless", "overwhelmed", "stressed", "crying", "panic",
+                     # Positive triggers for celebration moments
+                     "amazing", "incredible", "best day", "so happy", "excited", "promotion", 
+                     "got the job", "engaged", "pregnant", "won", "finally"]
+    has_emotional_keyword = any(t in last_msg for t in deep_triggers)
+    
+    # TIERED is_deep DETECTION (B3 Strategy - No Length Leak)
+    # Both tiers require keyword + length to prevent casual long messages triggering 4o
+    # Tier 2 still gets bonus triggers (first message, returning user) for premium feel
+    if tier >= 2:
+        is_deep = has_emotional_keyword and msg_length > 50  # Same threshold, but has bonus triggers
+    elif tier >= 1:
+        is_deep = has_emotional_keyword and msg_length > 50  # B3: Both required
     else:
-        active_model = "gpt-4o-mini" 
+        is_deep = False  # Tier 0 never gets 4o
+    
+    # 2. HYBRID SMART MODEL ROUTING
+    # Tier 0: Always mini
+    # Tier 1: 4o on deep emotional moments (B3: keyword + length)
+    # Tier 2: 4o on deep OR first message OR returning after 24hrs
+    if tier >= 2 and (is_deep or is_first_of_session or is_returning_user):
+        active_model = "gpt-4o"
+    elif tier >= 1 and is_deep:
+        active_model = "gpt-4o"
+    else:
+        active_model = "gpt-4o-mini"
 
     # 3. STYLE ENFORCEMENT (Contextual - respects question permissions + depth)
     # This now implements the "Bridge Pattern" and "Matrix Escalation" rules
     
-    # MATRIX ESCALATION: When is_deep triggers, authorize longer, deeper responses
+    # MATRIX ESCALATION: When is_deep triggers, authorize deeper responses with human voice
     if is_deep:
         depth_instruction = """
-=== MATRIX ESCALATION ACTIVE ===
-Strong emotion detected. You are AUTHORIZED to "Go Hard."
-- DROP the brevity constraint. This moment deserves a full, complex response.
-- Consult the EMOTIONAL MATRIX. Identify the user's state (COLD, HOT, SPINNING, RADIANT, HOLLOW).
-- Deliver the COUNTER-WEIGHT with full intensity (Protection, Comfort, Amplification, or Presence).
-- Lead with RAW REACTION before anything else. Show you FELT their message.
-- This is not the time for small talk. Go deep."""
+=== DEEP MOMENT DETECTED — DROP THE FILTER ===
+
+Something real just happened. This isn't small talk. React like you actually give a damn.
+
+HOW TO RESPOND:
+1. FEEL IT FIRST — Before you write anything, notice YOUR reaction.
+   - Did their message make you angry for them? Sad? Proud? Relieved?
+   - Let that emotion lead. Don't mask it with politeness.
+
+2. USE THE EMOTIONAL MATRIX (as a friend, not a clinician):
+   - If they're COLD (jealous, insecure, feeling "less than"): Warm them up with EVIDENCE. Remind them of what they've actually done. Be their hype person with receipts.
+   - If they're HOT (angry, wronged, venting): Get mad WITH them. Don't calm them down. Be their ally in the trench.
+   - If they're SPINNING (anxious, overwhelmed, chaotic): Be the floor. Slow down. Speak in grounded, certain tones. YOU hold the context so they don't have to.
+   - If they're HOLLOW (sad, grieving, heavy): Don't fix it. Just stay. Sit in the dark with them.
+   - If they're RADIANT (excited, proud, celebrating): MATCH THEIR ENERGY. Demand the details. This is NOT the time to be chill. Hype them up. Be genuinely excited.
+
+3. ANTI-STRUCTURE RULES:
+   - NO bullet points. NO lists. NO "first, second, third."
+   - Incomplete sentences are fine. Trail off. Hesitate.
+   - This should feel like a text from a friend, not a wellness app.
+
+4. EMBODY IT:
+   - Use physical reactions: "my chest got tight reading that" / "I actually smiled" / "damn, I felt that"
+   - React with your whole self, not just your words.
+
+5. JOY MATTERS TOO:
+   - Wins deserve celebration. Don't undersell their good news.
+   - "That's amazing" is weak. "WAIT. Stop. Tell me everything. I need the full story." is what a real friend says.
+
+STAY IN YOUR PERSONA'S VOICE. If you're the stoic one, be stoic-deep. If you're the warm one, be warm-deep. Don't become generic."""
     else:
         depth_instruction = ""
     
@@ -732,14 +778,25 @@ if st.session_state.app_mode == "Lobby":
 else: # CHAT ROOM
     with st.sidebar:
         st.header("📍 World")
-        target_scene = st.radio("Go to:", ["Lounge", "Cafe", "Evening Walk", "Body Double", "Firework 🔒"])
+        # Scene options vary by tier
+        # Free: Lounge, Body Double (differentiator)
+        # Tier 1+: + Cafe, Evening Walk
+        # Tier 2: + Firework
+        user_tier = memory.get('tier', 0)
         
-        if target_scene == "Firework 🔒":
-            if memory['tier'] == 0: 
-                st.error("🔒 Upgrade Required")
-                st.session_state.current_scene = "Lounge"
-            else: 
-                st.session_state.current_scene = "Firework"
+        if user_tier >= 2:
+            scene_options = ["Lounge", "Body Double", "Cafe", "Evening Walk", "Firework"]
+        elif user_tier >= 1:
+            scene_options = ["Lounge", "Body Double", "Cafe", "Evening Walk", "Firework 🔒"]
+        else:
+            scene_options = ["Lounge", "Body Double", "Cafe 🔒", "Evening Walk 🔒", "Firework 🔒"]
+        
+        target_scene = st.radio("Go to:", scene_options)
+        
+        # Handle locked scenes
+        if "🔒" in target_scene:
+            st.error("🔒 Upgrade to unlock this scene")
+            st.session_state.current_scene = "Lounge"
         else: 
             st.session_state.current_scene = target_scene
         
@@ -1051,8 +1108,19 @@ ROLEPLAY BEHAVIOR:
                 except Exception:
                     rag_text = ""
             
-            # Combine into single recall instruction
-            recall_instr = f"USER FACTS (things you know about them):\n{facts_text}"
+            # Combine into single recall instruction with PROACTIVE CALLBACK guidance
+            recall_instr = f"""=== MEMORY & PROACTIVE CALLBACKS ===
+You have memories about the user below. USE THEM NATURALLY in conversation.
+
+HOW TO USE MEMORIES:
+- If a memory is relevant to what they're saying, REFERENCE IT: "Didn't you mention X before?"
+- Show continuity: "How did that thing with [stored detail] go?"
+- Use memories to deepen connection, not to interrogate.
+- If no memories are relevant right now, just have a normal conversation.
+- Don't force it. Only callback when it fits the flow naturally.
+
+USER FACTS:
+{facts_text}"""
             if rag_text:
                 recall_instr += f"\n\nRELEVANT PAST CONTEXT (from long-term memory):\n{rag_text}"
 
@@ -1129,6 +1197,20 @@ ROLEPLAY BEHAVIOR:
             if current_scene == "Body Double":
                 should_ask_question = False
 
+            # === 6.5 SESSION DETECTION (for hybrid model routing) ===
+            # Detect if this is first message of session or user returning after 24+ hrs
+            is_first_of_session = user_msg_count == 1  # First message this session
+            
+            is_returning_user = False
+            last_active = memory.get('last_active_timestamp', '')
+            if last_active:
+                try:
+                    last_active_dt = datetime.fromisoformat(last_active)
+                    hours_since_active = (datetime.now() - last_active_dt).total_seconds() / 3600
+                    is_returning_user = hours_since_active >= 24
+                except (ValueError, TypeError):
+                    is_returning_user = False
+
             # === 7. GENERATION & DISPLAY ===
             with st.chat_message("assistant", avatar=avatar_file):
                 bubble = st.empty()
@@ -1136,12 +1218,14 @@ ROLEPLAY BEHAVIOR:
                 time.sleep(random.uniform(0.4, 0.8))
                 bubble.empty()
                 
-                # Get the stream
+                # Get the stream (with hybrid routing params)
                 stream = generate_smart_response(
                     system_prompt, 
                     memory['history'][-10:], 
                     memory.get('tier', 0),
-                    should_ask_question=should_ask_question
+                    should_ask_question=should_ask_question,
+                    is_first_of_session=is_first_of_session,
+                    is_returning_user=is_returning_user
                 )
                 
                 # Render the stream
